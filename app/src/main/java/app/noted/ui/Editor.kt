@@ -286,9 +286,18 @@ fun LiveEditor(
             var first = active.first
             while (first < active.last && first < raw.length && (raw[first] == ' ' || raw[first] == '\t')) first++
             val x = if (first < len) lay.getHorizontalPosition(first, true) else 0f
-            val top = lay.getLineTop(lay.getLineForOffset(active.first.coerceIn(0, len)))
-            val bottom = lay.getLineBottom(lay.getLineForOffset(active.last.coerceIn(0, len)))
-            pillTarget = Rect(x, top, 0f, bottom)
+            // Centre on the letters themselves (midway between baseline and cap height), not on the
+            // line box: the font's ascent/descent padding is lopsided, which made the pill look off-centre.
+            val half = with(density) { BodyLine.toPx() / 2f - 2.dp.toPx() }
+            fun mid(off: Int): Float {
+                val o = off.coerceIn(0, len)
+                val rawLine = (lineStarts.indexOfLast { it <= o }).coerceAtLeast(0)
+                val info = infos.getOrNull(rawLine)
+                val size = if (info?.kind == LineKind.HEADING) headingSize(info.level) else 15.sp
+                val fontPx = with(density) { size.toPx() }
+                return lay.getLineBaseline(lay.getLineForOffset(o)) - fontPx * 0.355f
+            }
+            pillTarget = Rect(x, mid(active.first) - half, 0f, mid(active.last) + half)
         }
     }
     val spec = spring<Float>(stiffness = 900f)
@@ -317,10 +326,9 @@ fun LiveEditor(
             }
             // The line being edited: a rounded dark-grey pill that stays inside its own line box.
             if (active.first <= len && pillBottom > pillTop) {
-                val inset = 1.dp.toPx()
                 drawRoundRect(
-                    C.Pill, topLeft = Offset(pillX - 12.dp.toPx(), pillTop + inset),
-                    size = Size(size.width - pillX + 22.dp.toPx(), pillBottom - pillTop - 2 * inset),
+                    C.Pill, topLeft = Offset(pillX - 12.dp.toPx(), pillTop),
+                    size = Size(size.width - pillX + 22.dp.toPx(), pillBottom - pillTop),
                     cornerRadius = CornerRadius(14.dp.toPx()),
                 )
             }
@@ -330,7 +338,7 @@ fun LiveEditor(
                     val b = lay2.getBoundingBox(d.open + 2)
                     val side = 16.dp.toPx()
                     val cx = (a.left + b.right) / 2f
-                    val cy = (lineTop(d.open) + lineBottom(d.open)) / 2f
+                    val cy = lay2.getLineBaseline(lay2.getLineForOffset(d.open.coerceIn(0, len))) - 15.sp.toPx() * 0.355f
                     val tl = Offset(cx - side / 2, cy - side / 2)
                     if (d.checked) {
                         drawRoundRect(C.White, tl, Size(side, side), CornerRadius(4.dp.toPx()))
@@ -382,8 +390,7 @@ fun LiveEditor(
                 if (hidden[h]) continue
                 val start = lineStarts[h].coerceIn(0, len)
                 val ln = l.getLineForOffset(start)
-                val top = l.getLineTop(ln)
-                val mid = (top + l.getLineBottom(ln)) / 2f
+                val mid = l.getLineBaseline(ln) - with(density) { headingSize(infos[h].level).toPx() } * 0.355f
                 val key = headingKey(lines[h])
                 val closed = key in effectiveFolded
                 FoldChevron(
