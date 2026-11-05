@@ -1,0 +1,67 @@
+{
+  "name": "noted-desktop",
+  "productName": "Noted",
+  "version": "0.2.0",
+  "description": "Minimal OLED markdown editor",
+  "main": "main.js",
+  "author": "Daniel",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable --x64",
+    "dist:mac": "electron-builder --mac zip --arm64 --x64"
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8",
+    "resedit": "^2.0.3"
+  },
+  "build": {
+    "appId": "app.noted.desktop",
+    "productName": "Noted",
+    "copyright": "Noted",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Noted-${version}-portable.exe"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.productivity",
+      "identity": null,
+      "artifactName": "Noted-${version}-mac-${arch}.${ext}"
+    },
+    "afterPack": "build/afterPack.js",
+    "publish": null
+  },
+  "repository": "github:senseldeez/noted"
+}
