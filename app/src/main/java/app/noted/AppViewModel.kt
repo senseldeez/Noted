@@ -2,7 +2,9 @@ package app.noted
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
 import android.os.Environment
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -12,6 +14,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.noted.data.Entry
 import app.noted.data.Store
+import app.noted.data.removeMdExtension
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -34,6 +37,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     val stack = mutableStateListOf<Screen>()
     val entries = mutableStateMapOf<String, List<Entry>>()
+
+    /** Folded heading sections per note (by heading text), shared by reading and editing mode. */
+    private val folds = mutableStateMapOf<String, Set<String>>()
+
+    fun foldsFor(file: File): Set<String> = folds[file.absolutePath] ?: emptySet()
+
+    fun toggleFold(file: File, key: String) {
+        val cur = foldsFor(file)
+        folds[file.absolutePath] = if (key in cur) cur - key else cur + key
+    }
 
     init {
         resetStack()
@@ -152,6 +165,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val f = withContext(Dispatchers.IO) { Store.createNote(dir, name) }
             refresh(dir)
             push(Screen.Note(f, editing = true))
+        }
+    }
+
+    /** Copy picked .md files into [dir]. Reports (imported, skipped). */
+    fun importFiles(dir: File, uris: List<Uri>, onDone: (Int, Int) -> Unit) {
+        val cr = getApplication<Application>().contentResolver
+        viewModelScope.launch {
+            var ok = 0
+            var skipped = 0
+            withContext(Dispatchers.IO) {
+                for (uri in uris) {
+                    val name = try {
+                        cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                            if (c.moveToFirst()) c.getString(0) else null
+                        }
+                    } catch (e: Exception) { null } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "Imported"
+                    val mime = try { cr.getType(uri) } catch (e: Exception) { null } ?: ""
+                    val isMd = name.endsWith(".md", true) || name.endsWith(".markdown", true) || mime.contains("markdown")
+                    if (!isMd) { skipped++; continue }
+                    try {
+                        val target = Store.uniqueFile(dir, Store.sanitize(name).removeMdExtension(), ".md")
+                        cr.openInputStream(uri)?.use { input -> target.outputStream().use { input.copyTo(it) } }
+                            ?: throw IllegalStateException("unreadable")
+                        ok++
+                    } catch (e: Exception) {
+                        skipped++
+                    }
+                }
+            }
+            refresh(dir)
+            onDone(ok, skipped)
         }
     }
 

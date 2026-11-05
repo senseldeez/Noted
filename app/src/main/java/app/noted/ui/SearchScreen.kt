@@ -69,13 +69,13 @@ fun SearchScreen(vm: AppViewModel) {
             IconBtn(Icons.Back, "Back") { vm.pop() }
             BasicTextField(
                 value = query, onValueChange = { query = it }, singleLine = true,
-                textStyle = TextStyle(fontFamily = Mono, fontSize = 15.sp, color = C.White),
+                textStyle = TextStyle(fontFamily = Sans, fontSize = 15.sp, color = C.White),
                 cursorBrush = SolidColor(C.White),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 modifier = Modifier.weight(1f).focusRequester(fr),
                 decorationBox = { inner ->
                     Box(
-                        Modifier.fillMaxWidth().height(48.dp).border(1.dp, C.Border, RoundedCornerShape(24.dp)).padding(horizontal = 18.dp),
+                        Modifier.fillMaxWidth().height(48.dp).border(LineW, C.Border, RoundedCornerShape(24.dp)).padding(horizontal = 18.dp),
                         contentAlignment = Alignment.CenterStart,
                     ) {
                         if (query.isEmpty()) Text("Search all notes", fontSize = 15.sp, color = C.Muted)
@@ -93,7 +93,7 @@ fun SearchScreen(vm: AppViewModel) {
         ) {
             items(hits, key = { it.file.absolutePath }) { h ->
                 Column(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).border(1.dp, C.Border, RoundedCornerShape(20.dp))
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).border(LineW, C.Border, RoundedCornerShape(20.dp))
                         .clickable { vm.push(Screen.Note(h.file)) }.padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {

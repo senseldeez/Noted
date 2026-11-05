@@ -22,17 +22,23 @@ import app.noted.R
 object C {
     val Black = Color(0xFF000000)
     val White = Color(0xFFFFFFFF)
-    val Border = Color(0xFF2A2A2A)
-    val Divider = Color(0xFF1C1C1C)
+    val Border = Color(0xFF333333)
+    val Divider = Color(0xFF222222)
     val Pill = Color(0xFF161616)
     val Toolbar = Color(0xFF1C1C1C)
     val Text2 = Color(0xFFD6D6D6)
     val Text3 = Color(0xFFB5B5B5)
     val Muted = Color(0xFF8F8F8F)
     val Syntax = Color(0xFF7A7A7A)
-    val Guide = Color(0xFF262626)
+    val Guide = Color(0xFF2E2E2E)
     val CodeBg = Color(0xFF0E0E0E)
 }
+
+/** Standard outline width: the "solid" look uses 2dp lines everywhere. */
+val LineW = 2.dp
+
+/** UI and note text use the phone's own sans-serif; monospace is kept for code only. */
+val Sans = FontFamily.Default
 
 val Mono = FontFamily(
     Font(R.font.jetbrains_mono_regular, FontWeight.Normal),
@@ -42,7 +48,7 @@ val Mono = FontFamily(
 )
 
 private fun t(size: Int, weight: FontWeight = FontWeight.Normal, lh: Float = 1.5f) =
-    TextStyle(fontFamily = Mono, fontSize = size.sp, fontWeight = weight, lineHeight = (size * lh).sp, color = C.White)
+    TextStyle(fontFamily = Sans, fontSize = size.sp, fontWeight = weight, lineHeight = (size * lh).sp, color = C.White)
 
 @Composable
 fun NotedTheme(content: @Composable () -> Unit) {
@@ -72,7 +78,7 @@ fun NotedTheme(content: @Composable () -> Unit) {
 
 /* Icons, drawn from the same SVG paths as the mockups (24x24 viewBox). */
 object Icons {
-    private fun build(name: String, vararg parts: Pair<String, Boolean>, stroke: Float = 1.8f): ImageVector {
+    private fun build(name: String, vararg parts: Pair<String, Boolean>, stroke: Float = 2.3f): ImageVector {
         val b = ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f)
         for ((d, filled) in parts) {
             val nodes = PathParser().parsePathString(d).toNodes()
@@ -90,32 +96,34 @@ object Icons {
     val Search = build("search", circle(11f, 11f, 7f) to false, "M20 20l-4-4" to false)
     val More = build("more", circle(12f, 5f, 1.7f) to true, circle(12f, 12f, 1.7f) to true, circle(12f, 19f, 1.7f) to true)
     val MoreH = build("moreh", circle(5f, 12f, 1.7f) to true, circle(12f, 12f, 1.7f) to true, circle(19f, 12f, 1.7f) to true)
-    val Plus = build("plus", "M12 5v14M5 12h14" to false, stroke = 2.2f)
+    val Plus = build("plus", "M12 5v14M5 12h14" to false, stroke = 2.6f)
     val Back = build("back", "M15 5l-7 7 7 7" to false)
     val Close = build("close", "M6 6l12 12M18 6L6 18" to false)
     val Folder = build("folder", "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" to true)
     val FolderOutline = build("folderOutline", "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" to false)
-    val PinFilled = build("pinFilled", "M9 3h6l-1 7 4 4H6l4-4z" to true, "M12 14v7" to false, stroke = 2f)
+    val PinFilled = build("pinFilled", "M9 3h6l-1 7 4 4H6l4-4z" to true, "M12 14v7" to false, stroke = 2.4f)
     val Pin = build("pin", "M9 3h6l-1 7 4 4H6l4-4z" to false, "M12 14v7" to false)
     val Move = build("move", "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" to false, "M10 13h6M13 10l3 3-3 3" to false)
     val Delete = build("delete", "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" to false)
-    val Edit = build("edit", "M4 20h4L19 9l-4-4L4 16z" to false, "M13 7l4 4" to false, stroke = 2f)
+    val Edit = build("edit", "M4 20h4L19 9l-4-4L4 16z" to false, "M13 7l4 4" to false, stroke = 2.4f)
     val Rename = build("rename", "M4 20h4L19 9l-4-4L4 16z" to false, "M13 7l4 4" to false)
     val Undo = build("undo", "M9 14L4 9l5-5" to false, "M4 9h10a6 6 0 0 1 0 12h-3" to false)
     val Redo = build("redo", "M15 14l5-5-5-5" to false, "M20 9H10a6 6 0 0 0 0 12h3" to false)
-    val Chevron = build("chevron", "M9 6l6 6-6 6" to false, stroke = 2.4f)
+    val Chevron = build("chevron", "M9 6l6 6-6 6" to false, stroke = 2.6f)
     val Bullets = build(
         "bullets", circle(5f, 7f, 1.3f) to true, circle(5f, 12f, 1.3f) to true, circle(5f, 17f, 1.3f) to true,
-        "M10 7h10M10 12h10M10 17h10" to false, stroke = 2f,
+        "M10 7h10M10 12h10M10 17h10" to false, stroke = 2.4f,
     )
-    val Numbers = build("numbers", "M4 5h1.5v4M4 9h3M4 14.5a1.5 1.5 0 0 1 3 0c0 1.5-3 2-3 3.5h3M10 7h10M10 12h10M10 17h10" to false, stroke = 2f)
-    val Checkbox = build("checkbox", "M8 4h8a4 4 0 0 1 4 4v8a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4V8a4 4 0 0 1 4-4z" to false, "M8.5 12l2.5 2.5 4.5-5" to false, stroke = 2f)
-    val Indent = build("indent", "M20 6H10M20 12h-7M20 18H10M4 9l3 3-3 3" to false, stroke = 2f)
-    val Outdent = build("outdent", "M20 6H10M20 12h-7M20 18H10M7 9l-3 3 3 3" to false, stroke = 2f)
-    val Quote = build("quote", "M5 6v12" to false, "M10 8h9M10 12h9M10 16h6" to false, stroke = 2f)
-    val Code = build("code", "M8 7l-5 5 5 5M16 7l5 5-5 5" to false, stroke = 2f)
-    val Link = build("link", "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" to false, "M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" to false, stroke = 2f)
-    val Rule = build("rule", "M4 12h16" to false, stroke = 2f)
-    val Checkmark = build("check", "M6 12.5l4 4 8-9" to false, stroke = 2.8f)
+    val Numbers = build("numbers", "M4 5h1.5v4M4 9h3M4 14.5a1.5 1.5 0 0 1 3 0c0 1.5-3 2-3 3.5h3M10 7h10M10 12h10M10 17h10" to false, stroke = 2.4f)
+    val Checkbox = build("checkbox", "M8 4h8a4 4 0 0 1 4 4v8a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4V8a4 4 0 0 1 4-4z" to false, "M8.5 12l2.5 2.5 4.5-5" to false, stroke = 2.4f)
+    val Indent = build("indent", "M20 6H10M20 12h-7M20 18H10M4 9l3 3-3 3" to false, stroke = 2.4f)
+    val Outdent = build("outdent", "M20 6H10M20 12h-7M20 18H10M7 9l-3 3 3 3" to false, stroke = 2.4f)
+    val Quote = build("quote", "M5 6v12" to false, "M10 8h9M10 12h9M10 16h6" to false, stroke = 2.4f)
+    val Code = build("code", "M8 7l-5 5 5 5M16 7l5 5-5 5" to false, stroke = 2.4f)
+    val Link = build("link", "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" to false, "M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" to false, stroke = 2.4f)
+    val Rule = build("rule", "M4 12h16" to false, stroke = 2.4f)
+    val Checkmark = build("check", "M6 12.5l4 4 8-9" to false, stroke = 3f)
+    val Read = build("read", "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" to false, circle(12f, 12f, 3f) to false)
+    val Import = build("import", "M12 3v12M7 10l5 5 5-5" to false, "M5 21h14" to false)
     val Note = build("note", "M7 3h7l5 5v13H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" to false, "M14 3v5h5" to false)
 }

@@ -1,6 +1,20 @@
 package app.noted.ui
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.core.VisibilityThreshold
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.foundation.background
@@ -72,6 +86,7 @@ private class DragState {
     var pointer by mutableStateOf(Offset.Zero)
     var grab = Offset.Zero
     var lastSwap: String? = null
+    var pressed by mutableStateOf<String?>(null)
 }
 
 private const val PINNED_HEADER = "::pinned"
@@ -91,6 +106,17 @@ fun FolderScreen(vm: AppViewModel, dir: File) {
     val selEntries = list.orEmpty().filter { it.key in selected }
 
     BackHandler(enabled = selecting) { selected = emptySet() }
+
+    val ctx = LocalContext.current
+    val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) vm.importFiles(dir, uris) { ok, skipped ->
+            val msg = buildString {
+                append(if (ok == 1) "Imported 1 note" else "Imported $ok notes")
+                if (skipped > 0) append(" · skipped $skipped (not .md)")
+            }
+            Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+        }
+    }
 
     Box(Modifier.fillMaxSize().background(C.Black)) {
         Column(Modifier.fillMaxSize().statusBarsPadding()) {
@@ -114,7 +140,7 @@ fun FolderScreen(vm: AppViewModel, dir: File) {
                     if (!isRoot) IconBtn(Icons.Back, "Back") { vm.pop() }
                     Text(
                         if (isRoot) "Noted" else dir.name,
-                        fontSize = if (isRoot) 26.sp else 20.sp, fontWeight = FontWeight.Bold,
+                        fontSize = if (isRoot) 28.sp else 21.sp, fontWeight = FontWeight.ExtraBold,
                         letterSpacing = (-0.5).sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
@@ -157,7 +183,12 @@ fun FolderScreen(vm: AppViewModel, dir: File) {
             }
         }
 
-        if (selecting) {
+        AnimatedVisibility(
+            visible = selecting,
+            enter = slideInVertically(spring(stiffness = 500f)) { it } + fadeIn(),
+            exit = slideOutVertically(tween(180)) { it } + fadeOut(tween(180)),
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
             SelectionBar(
                 allPinned = selEntries.isNotEmpty() && selEntries.all { it.pinned },
                 single = selEntries.size == 1,
@@ -165,17 +196,27 @@ fun FolderScreen(vm: AppViewModel, dir: File) {
                 onMove = { dialog = "move" },
                 onRename = { dialog = "rename" },
                 onDelete = { dialog = "delete" },
-                modifier = Modifier.align(Alignment.BottomCenter),
+                modifier = Modifier,
             )
-        } else {
-            Box(Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 20.dp, bottom = 24.dp)) {
+        }
+        AnimatedVisibility(
+            visible = !selecting,
+            enter = scaleIn(spring(stiffness = 500f, dampingRatio = 0.7f), initialScale = 0.6f) + fadeIn(),
+            exit = scaleOut(tween(150), targetScale = 0.6f) + fadeOut(tween(150)),
+            modifier = Modifier.align(Alignment.BottomEnd),
+        ) {
+            Box(Modifier.navigationBarsPadding().padding(end = 20.dp, bottom = 24.dp)) {
                 Box(
                     Modifier.size(60.dp).clip(CircleShape).background(C.White).clickable(onClickLabel = "New note or folder") { addMenu = true },
                     contentAlignment = Alignment.Center,
                 ) { Icon(Icons.Plus, "New note or folder", tint = C.Black, modifier = Modifier.size(26.dp)) }
                 Menu(
                     addMenu, { addMenu = false },
-                    listOf("New note" to { dialog = "newNote" }, "New folder" to { dialog = "newFolder" }),
+                    listOf(
+                        "New note" to { dialog = "newNote" },
+                        "New folder" to { dialog = "newFolder" },
+                        "Import .md files" to { importer.launch(arrayOf("text/*", "application/octet-stream")) },
+                    ),
                 )
             }
         }
@@ -251,6 +292,7 @@ private fun Grid(
 
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    drag.pressed = cardAt(down.position)?.key
                     var outcome = 0 // 0 = scroll/cancel, 1 = tap, 2 = long press
                     val res = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
                         while (true) {
@@ -264,8 +306,11 @@ private fun Grid(
                         }
                     }
                     if (res == null) outcome = 2
+                    if (outcome != 1) drag.pressed = null
                     if (outcome == 1) {
-                        cardAt(down.position)?.let { tap(it) }
+                        val hit = cardAt(down.position)
+                        drag.pressed = null
+                        hit?.let { tap(it) }
                         return@awaitEachGesture
                     }
                     if (outcome != 2) return@awaitEachGesture
@@ -311,21 +356,21 @@ private fun Grid(
         if (pinned.isNotEmpty()) {
             item(key = PINNED_HEADER, span = StaggeredGridItemSpan.FullLine) {
                 Text(
-                    "PINNED", fontSize = 11.sp, fontWeight = FontWeight.Medium, letterSpacing = 1.sp, color = C.Muted,
+                    "PINNED", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = C.Muted,
                     modifier = Modifier.padding(start = 6.dp, top = 4.dp),
                 )
             }
             items(pinned.size, key = { pinned[it].key }) { i ->
                 val e = pinned[i]
-                DraggableCard(e, e.key in selected, drag, state, Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null, placementSpec = if (drag.key == e.key) null else androidx.compose.animation.core.spring(stiffness = 600f, visibilityThreshold = IntOffset.VisibilityThreshold)))
+                DraggableCard(e, e.key in selected, drag, state, Modifier.animateItem(fadeInSpec = tween(220), fadeOutSpec = tween(160), placementSpec = if (drag.key == e.key) null else androidx.compose.animation.core.spring(stiffness = 600f, visibilityThreshold = IntOffset.VisibilityThreshold)))
             }
             item(key = DIVIDER, span = StaggeredGridItemSpan.FullLine) {
-                Box(Modifier.padding(horizontal = 4.dp, vertical = 6.dp).fillMaxWidth().height(1.dp).background(C.Divider))
+                Box(Modifier.padding(horizontal = 4.dp, vertical = 6.dp).fillMaxWidth().height(2.dp).background(C.Divider))
             }
         }
         items(rest.size, key = { rest[it].key }) { i ->
             val e = rest[i]
-            DraggableCard(e, e.key in selected, drag, state, Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null, placementSpec = if (drag.key == e.key) null else androidx.compose.animation.core.spring(stiffness = 600f, visibilityThreshold = IntOffset.VisibilityThreshold)))
+            DraggableCard(e, e.key in selected, drag, state, Modifier.animateItem(fadeInSpec = tween(220), fadeOutSpec = tween(160), placementSpec = if (drag.key == e.key) null else androidx.compose.animation.core.spring(stiffness = 600f, visibilityThreshold = IntOffset.VisibilityThreshold)))
         }
     }
 }
@@ -333,15 +378,17 @@ private fun Grid(
 @Composable
 private fun DraggableCard(e: Entry, selected: Boolean, drag: DragState, state: LazyStaggeredGridState, modifier: Modifier) {
     val dragging = drag.key == e.key
+    val press by animateFloatAsState(if (drag.pressed == e.key && !dragging) 0.96f else 1f, spring(stiffness = 900f), label = "press")
+    val lift by animateFloatAsState(if (dragging) 1f else 0f, spring(stiffness = 600f), label = "lift")
     Box(
         modifier
             .zIndex(if (dragging) 1f else 0f)
             .drawBehind {
                 if (dragging) {
-                    val r = 20.dp.toPx()
+                    val r = 22.dp.toPx()
                     drawRoundRect(
                         color = Color(0xFF6A6A6A), cornerRadius = CornerRadius(r),
-                        style = Stroke(width = 1.5.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f))),
+                        style = Stroke(width = 2.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f))),
                     )
                 }
             },
@@ -355,9 +402,9 @@ private fun DraggableCard(e: Entry, selected: Boolean, drag: DragState, state: L
                         translationX = drag.pointer.x - drag.grab.x - info.offset.x
                         translationY = drag.pointer.y - drag.grab.y - (info.offset.y - state.layoutInfo.viewportStartOffset)
                     }
-                    scaleX = 1.05f; scaleY = 1.05f
-                    rotationZ = -3f
                 }
+                scaleX = press * (1f + 0.05f * lift); scaleY = scaleX
+                rotationZ = -3f * lift
             },
             raised = dragging,
         )
@@ -366,20 +413,20 @@ private fun DraggableCard(e: Entry, selected: Boolean, drag: DragState, state: L
 
 @Composable
 private fun Card(e: Entry, highlighted: Boolean, modifier: Modifier, raised: Boolean = false) {
-    val shape = RoundedCornerShape(20.dp)
+    val shape = RoundedCornerShape(22.dp)
     Column(
         modifier
             .fillMaxWidth()
             .clip(shape)
-            .background(if (raised) Color(0xFF0D0D0D) else C.Black)
-            .border(if (highlighted) 1.5.dp else 1.dp, if (highlighted) C.White else C.Border, shape)
+            .background(if (raised) Color(0xFF111111) else C.Black)
+            .border(if (highlighted) 2.5.dp else LineW, if (highlighted) C.White else C.Border, shape)
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(if (e.isFolder) 8.dp else 6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (e.isFolder) Icon(Icons.Folder, null, tint = C.White, modifier = Modifier.size(16.dp))
             Text(
-                e.title, fontSize = 14.sp, fontWeight = FontWeight.Bold, lineHeight = 19.sp,
+                e.title, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold, lineHeight = 20.sp,
                 maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
             )
             if (e.pinned) Icon(Icons.PinFilled, "Pinned", tint = C.White, modifier = Modifier.size(14.dp))
@@ -419,7 +466,7 @@ private fun NotePreview(src: String, title: String) {
                 LineKind.TASK -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Box(
                         Modifier.padding(start = (indentWidth(l, info.indent) * 4).dp).size(11.dp).clip(RoundedCornerShape(3.dp))
-                            .then(if (info.checked) Modifier.background(C.White) else Modifier.border(1.5.dp, C.Muted, RoundedCornerShape(3.dp))),
+                            .then(if (info.checked) Modifier.background(C.White) else Modifier.border(2.dp, C.Muted, RoundedCornerShape(3.dp))),
                     )
                     Text(
                         renderInline(l.substring(info.prefixEnd)), fontSize = 12.sp, lineHeight = 18.sp,
@@ -431,7 +478,7 @@ private fun NotePreview(src: String, title: String) {
                     renderInline(l.substring(info.prefixEnd)), fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold,
                     color = C.White, maxLines = 2, overflow = TextOverflow.Ellipsis,
                 )
-                LineKind.RULE -> Box(Modifier.padding(vertical = 4.dp).fillMaxWidth().height(1.dp).background(C.Border))
+                LineKind.RULE -> Box(Modifier.padding(vertical = 4.dp).fillMaxWidth().height(2.dp).background(C.Border))
                 else -> Text(
                     renderInline(l.trim()), fontSize = 12.sp, lineHeight = 18.sp, color = C.Text3,
                     maxLines = 4, overflow = TextOverflow.Ellipsis,

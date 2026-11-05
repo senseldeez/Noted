@@ -24,6 +24,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.ParagraphStyle
+import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.foundation.layout.offset
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import kotlin.math.roundToInt
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.CornerRadius
@@ -57,7 +72,41 @@ private val Hidden = SpanStyle(color = Color.Transparent, fontSize = 0.01.sp, le
 private val Invisible = SpanStyle(color = Color.Transparent)
 private val Dim = SpanStyle(color = C.Syntax, fontWeight = FontWeight.Normal, fontStyle = FontStyle.Normal, textDecoration = TextDecoration.None)
 
-fun headingSize(level: Int) = when (level) { 1 -> 24.sp; 2 -> 19.sp; 3 -> 16.sp; else -> 14.sp }
+/** Heading sizes are capped so every glyph fits inside the shared 28sp line box. */
+fun headingSize(level: Int) = when (level) { 1 -> 22.sp; 2 -> 19.sp; 3 -> 17.sp; else -> 15.sp }
+
+/** One line box height for every line. Glyphs stay inside their own box, so the active-line pill never touches its neighbours. */
+private val BodyLine = 28.sp
+private val CenteredLines = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.None)
+private val Folded = ParagraphStyle(lineHeight = 0.01.sp, lineHeightStyle = CenteredLines)
+
+/** Collapsible heading sections: heading line index -> first line index after its section. */
+fun sectionEnds(lines: List<String>, infos: List<LineInfo>): Map<Int, Int> {
+    val out = HashMap<Int, Int>()
+    for (i in lines.indices) {
+        val info = infos[i]
+        if (info.kind != LineKind.HEADING) continue
+        var j = i + 1
+        while (j < lines.size && !(infos[j].kind == LineKind.HEADING && infos[j].level <= info.level)) j++
+        // Only headings with something under them can fold.
+        if ((i + 1 until j).any { infos[it].kind != LineKind.BLANK }) out[i] = j
+    }
+    return out
+}
+
+/** Key that identifies a heading across edits and between reading and editing mode. */
+fun headingKey(line: String) = line.trim()
+
+/** Lines hidden because a heading above them is folded (unless the cursor is inside). */
+fun foldedLines(lines: List<String>, infos: List<LineInfo>, folded: Set<String>): BooleanArray {
+    val hidden = BooleanArray(lines.size)
+    if (folded.isEmpty()) return hidden
+    for ((h, end) in sectionEnds(lines, infos)) {
+        if (hidden[h] || headingKey(lines[h]) !in folded) continue
+        for (k in h + 1 until end) hidden[k] = true
+    }
+    return hidden
+}
 
 /** Character range [start, end) of the raw lines touched by the selection. */
 fun activeRange(text: String, sel: TextRange): IntRange {
@@ -68,17 +117,29 @@ fun activeRange(text: String, sel: TextRange): IntRange {
     return s..e
 }
 
-class LivePreview(private val active: IntRange) : VisualTransformation {
+class LivePreview(private val active: IntRange, private val folded: Set<String>) : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
         val raw = text.text
         val chars = raw.toCharArray()
         val base = mutableListOf<AnnotatedString.Range<SpanStyle>>()
         val top = mutableListOf<AnnotatedString.Range<SpanStyle>>()
+        val paras = mutableListOf<AnnotatedString.Range<ParagraphStyle>>()
         val lines = raw.split('\n')
         val infos = classifyLines(lines)
+        val hiddenLines = foldedLines(lines, infos, folded)
         var s = 0
         for ((i, l) in lines.withIndex()) {
             val e = s + l.length
+            val pEnd = if (e < raw.length) e + 1 else e
+            if (hiddenLines[i]) {
+                // Folded under a heading: squash the whole line to nothing.
+                if (pEnd > s) {
+                    paras += AnnotatedString.Range(Folded, s, pEnd)
+                    top += AnnotatedString.Range(Hidden, s, pEnd)
+                }
+                s = e + 1
+                continue
+            }
             val isActive = s <= active.last && e >= active.first
             fun hide(a: Int, b: Int) { if (b > a) top += AnnotatedString.Range(if (isActive) Dim else Hidden, a, b) }
             fun ghost(a: Int, b: Int) { if (b > a) top += AnnotatedString.Range(if (isActive) Dim else Invisible, a, b) }
@@ -125,8 +186,8 @@ class LivePreview(private val active: IntRange) : VisualTransformation {
                     inline(s + info.prefixEnd)
                 }
                 LineKind.RULE -> ghost(s, e)
-                LineKind.FENCE -> style(Dim, s, e)
-                LineKind.CODE -> style(SpanStyle(color = C.Text2), s, e)
+                LineKind.FENCE -> style(Dim.copy(fontFamily = Mono), s, e)
+                LineKind.CODE -> style(SpanStyle(color = C.Text2, fontFamily = Mono, fontSize = 13.sp), s, e)
                 LineKind.TEXT -> {
                     style(SpanStyle(color = C.Text2), s, e)
                     inline(s)
@@ -135,11 +196,11 @@ class LivePreview(private val active: IntRange) : VisualTransformation {
             }
             s = e + 1
         }
-        return TransformedText(AnnotatedString(String(chars), base + top), OffsetMapping.Identity)
+        return TransformedText(AnnotatedString(String(chars), base + top, paras), OffsetMapping.Identity)
     }
 
-    override fun equals(other: Any?) = other is LivePreview && other.active == active
-    override fun hashCode() = active.hashCode()
+    override fun equals(other: Any?) = other is LivePreview && other.active == active && other.folded == folded
+    override fun hashCode() = active.hashCode() * 31 + folded.hashCode()
 }
 
 private sealed class Deco {
@@ -149,16 +210,22 @@ private sealed class Deco {
     data class Code(val start: Int, val end: Int) : Deco()
 }
 
-private fun decorations(raw: String, active: IntRange): List<Deco> {
+private fun decorations(raw: String, active: IntRange, folded: Set<String>): List<Deco> {
     val out = mutableListOf<Deco>()
     val lines = raw.split('\n')
     val infos = classifyLines(lines)
+    val hidden = foldedLines(lines, infos, folded)
     var s = 0
     var fenceStart = -1
     for ((i, l) in lines.withIndex()) {
         val e = s + l.length
         val isActive = s <= active.last && e >= active.first
         val info = infos[i]
+        if (hidden[i]) {
+            if (fenceStart >= 0) { out += Deco.Code(fenceStart, maxOf(fenceStart, s - 1)); fenceStart = -1 }
+            s = e + 1
+            continue
+        }
         when (info.kind) {
             LineKind.FENCE -> if (fenceStart < 0) fenceStart = s else { out += Deco.Code(fenceStart, e); fenceStart = -1 }
             LineKind.TASK -> if (!isActive) out += Deco.Box(s + l.indexOf('[', info.markerStart), info.checked)
@@ -177,50 +244,93 @@ fun LiveEditor(
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     focus: FocusRequester,
+    folded: Set<String>,
+    onToggleFold: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val active = activeRange(value.text, value.selection)
-    val transformation = remember(active) { LivePreview(active) }
-    val decos = remember(value.text, active) { decorations(value.text, active) }
-    val textStyle = remember {
-        TextStyle(fontFamily = Mono, fontSize = 14.sp, lineHeight = 22.sp, color = C.White)
+    val lines = remember(value.text) { value.text.split('\n') }
+    val infos = remember(lines) { classifyLines(lines) }
+    val sections = remember(lines, infos) { sectionEnds(lines, infos) }
+    val lineStarts = remember(lines) {
+        val out = IntArray(lines.size)
+        var p = 0
+        for (i in lines.indices) { out[i] = p; p += lines[i].length + 1 }
+        out
     }
+    // A fold whose section holds the cursor opens up, so you never type into hidden text.
+    val effectiveFolded = remember(folded, sections, active, lines) {
+        if (folded.isEmpty()) folded
+        else folded.filterTo(HashSet()) { key ->
+            sections.none { (h, end) ->
+                headingKey(lines[h]) == key && active.last >= lineStarts[h] + lines[h].length + 1 &&
+                    active.first < (if (end < lines.size) lineStarts[end] else value.text.length + 1)
+            }
+        }
+    }
+    val transformation = remember(active, effectiveFolded) { LivePreview(active, effectiveFolded) }
+    val decos = remember(value.text, active, effectiveFolded) { decorations(value.text, active, effectiveFolded) }
+    val textStyle = remember {
+        TextStyle(fontFamily = Sans, fontSize = 15.sp, lineHeight = BodyLine, lineHeightStyle = CenteredLines, color = C.White)
+    }
+    val density = LocalDensity.current
+
+    // Where the active-line pill should sit; animated so it glides between lines.
+    val lay = layout
+    var pillTarget = Rect.Zero
+    if (lay != null) {
+        val len = lay.layoutInput.text.length
+        if (active.first <= len) {
+            val raw = value.text
+            var first = active.first
+            while (first < active.last && first < raw.length && (raw[first] == ' ' || raw[first] == '\t')) first++
+            val x = if (first < len) lay.getHorizontalPosition(first, true) else 0f
+            val top = lay.getLineTop(lay.getLineForOffset(active.first.coerceIn(0, len)))
+            val bottom = lay.getLineBottom(lay.getLineForOffset(active.last.coerceIn(0, len)))
+            pillTarget = Rect(x, top, 0f, bottom)
+        }
+    }
+    val spec = spring<Float>(stiffness = 900f)
+    val pillTop by animateFloatAsState(pillTarget.top, spec, label = "pillTop")
+    val pillBottom by animateFloatAsState(pillTarget.bottom, spec, label = "pillBottom")
+    val pillX by animateFloatAsState(pillTarget.left, spec, label = "pillX")
+
     Box(
         modifier.drawBehind {
-            val lay = layout ?: return@drawBehind
-            val len = lay.layoutInput.text.length
-            fun lineTop(off: Int) = lay.getLineTop(lay.getLineForOffset(off.coerceIn(0, len)))
-            fun lineBottom(off: Int) = lay.getLineBottom(lay.getLineForOffset(off.coerceIn(0, len)))
+            val lay2 = layout ?: return@drawBehind
+            val len = lay2.layoutInput.text.length
+            fun lineTop(off: Int) = lay2.getLineTop(lay2.getLineForOffset(off.coerceIn(0, len)))
+            fun lineBottom(off: Int) = lay2.getLineBottom(lay2.getLineForOffset(off.coerceIn(0, len)))
             // Code blocks.
             for (d in decos) if (d is Deco.Code) {
                 drawRoundRect(
-                    C.CodeBg, topLeft = Offset(-10.dp.toPx(), lineTop(d.start) - 4.dp.toPx()),
-                    size = Size(size.width + 20.dp.toPx(), lineBottom(d.end) - lineTop(d.start) + 8.dp.toPx()),
+                    C.CodeBg, topLeft = Offset(-10.dp.toPx(), lineTop(d.start)),
+                    size = Size(size.width + 20.dp.toPx(), lineBottom(d.end) - lineTop(d.start)),
                     cornerRadius = CornerRadius(14.dp.toPx()),
                 )
-            }
-            // The line being edited: a rounded dark-grey pill.
-            if (active.first <= len) {
-                val raw = value.text
-                var first = active.first
-                while (first < active.last && first < raw.length && (raw[first] == ' ' || raw[first] == '\t')) first++
-                val x = if (first < len) lay.getHorizontalPosition(first, true) else 0f
-                val top = lineTop(active.first) - 4.dp.toPx()
-                val bottom = lineBottom(active.last) + 4.dp.toPx()
                 drawRoundRect(
-                    C.Pill, topLeft = Offset(x - 12.dp.toPx(), top),
-                    size = Size(size.width - x + 22.dp.toPx(), bottom - top),
+                    C.Guide, topLeft = Offset(-10.dp.toPx(), lineTop(d.start)),
+                    size = Size(size.width + 20.dp.toPx(), lineBottom(d.end) - lineTop(d.start)),
+                    cornerRadius = CornerRadius(14.dp.toPx()), style = Stroke(LineW.toPx()),
+                )
+            }
+            // The line being edited: a rounded dark-grey pill that stays inside its own line box.
+            if (active.first <= len && pillBottom > pillTop) {
+                val inset = 1.dp.toPx()
+                drawRoundRect(
+                    C.Pill, topLeft = Offset(pillX - 12.dp.toPx(), pillTop + inset),
+                    size = Size(size.width - pillX + 22.dp.toPx(), pillBottom - pillTop - 2 * inset),
                     cornerRadius = CornerRadius(14.dp.toPx()),
                 )
             }
             for (d in decos) when (d) {
                 is Deco.Box -> if (d.open + 2 < len) {
-                    val a = lay.getBoundingBox(d.open)
-                    val b = lay.getBoundingBox(d.open + 2)
-                    val side = 15.dp.toPx()
+                    val a = lay2.getBoundingBox(d.open)
+                    val b = lay2.getBoundingBox(d.open + 2)
+                    val side = 16.dp.toPx()
                     val cx = (a.left + b.right) / 2f
-                    val cy = (a.top + a.bottom) / 2f
+                    val cy = (lineTop(d.open) + lineBottom(d.open)) / 2f
                     val tl = Offset(cx - side / 2, cy - side / 2)
                     if (d.checked) {
                         drawRoundRect(C.White, tl, Size(side, side), CornerRadius(4.dp.toPx()))
@@ -229,9 +339,9 @@ fun LiveEditor(
                             lineTo(tl.x + side * 0.43f, tl.y + side * 0.70f)
                             lineTo(tl.x + side * 0.76f, tl.y + side * 0.32f)
                         }
-                        drawPath(p, C.Black, style = Stroke(width = 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+                        drawPath(p, C.Black, style = Stroke(width = 2.4.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
                     } else {
-                        val w = 1.5.dp.toPx()
+                        val w = 2.dp.toPx()
                         drawRoundRect(
                             C.Muted, Offset(tl.x + w / 2, tl.y + w / 2), Size(side - w, side - w),
                             CornerRadius(4.dp.toPx()), style = Stroke(w),
@@ -239,12 +349,15 @@ fun LiveEditor(
                     }
                 }
                 is Deco.Bar -> {
-                    val x = lay.getHorizontalPosition(d.start.coerceIn(0, len), true)
-                    drawRect(C.White, Offset(x, lineTop(d.start)), Size(2.dp.toPx(), lineBottom(d.end) - lineTop(d.start)))
+                    val x = lay2.getHorizontalPosition(d.start.coerceIn(0, len), true)
+                    drawRoundRect(
+                        C.White, Offset(x, lineTop(d.start) + 3.dp.toPx()),
+                        Size(3.dp.toPx(), lineBottom(d.end) - lineTop(d.start) - 6.dp.toPx()), CornerRadius(2.dp.toPx()),
+                    )
                 }
                 is Deco.Rule -> {
                     val y = (lineTop(d.start) + lineBottom(d.start)) / 2f
-                    drawRect(C.Border, Offset(0f, y), Size(size.width, 1.dp.toPx()))
+                    drawRect(C.Border, Offset(0f, y - 1.dp.toPx()), Size(size.width, LineW.toPx()))
                 }
                 is Deco.Code -> {}
             }
@@ -260,6 +373,40 @@ fun LiveEditor(
             keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, autoCorrectEnabled = true),
             modifier = Modifier.fillMaxWidth().focusRequester(focus),
         )
+        // Fold chevrons in the left gutter, one per heading that has content.
+        val l = layout
+        if (l != null) {
+            val len = l.layoutInput.text.length
+            val hidden = remember(lines, infos, effectiveFolded) { foldedLines(lines, infos, effectiveFolded) }
+            for ((h, _) in sections) {
+                if (hidden[h]) continue
+                val start = lineStarts[h].coerceIn(0, len)
+                val ln = l.getLineForOffset(start)
+                val top = l.getLineTop(ln)
+                val mid = (top + l.getLineBottom(ln)) / 2f
+                val key = headingKey(lines[h])
+                val closed = key in effectiveFolded
+                FoldChevron(
+                    closed = closed,
+                    modifier = Modifier.offset {
+                        IntOffset(-with(density) { 30.dp.roundToPx() }, (mid - with(density) { 14.dp.toPx() }).roundToInt())
+                    },
+                ) { onToggleFold(key) }
+            }
+        }
+    }
+}
+
+/** Small round chevron button: points right when folded, down when open. */
+@Composable
+fun FoldChevron(closed: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val angle by animateFloatAsState(if (closed) 0f else 90f, spring(stiffness = 700f), label = "chevron")
+    Box(
+        modifier.size(28.dp).clip(RoundedCornerShape(14.dp))
+            .clickable(onClickLabel = if (closed) "Expand section" else "Collapse section", onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(Icons.Chevron, null, tint = if (closed) C.White else C.Muted, modifier = Modifier.size(14.dp).rotate(angle))
     }
 }
 
@@ -498,7 +645,7 @@ fun FormatToolbar(value: TextFieldValue, onChange: (TextFieldValue) -> Unit, mod
     val bold = Ops.inside(value, InlineKind.BOLD)
     val italic = Ops.inside(value, InlineKind.ITALIC)
     Column(modifier.padding(horizontal = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (more) {
+        AnimatedVisibility(more, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
             Pill {
                 ToolIcon(Icons.Outdent, "Outdent") { onChange(Ops.outdent(value)) }
                 ToolText("S", "Strikethrough", strike = true) { onChange(Ops.wrap(value, "~~")) }
