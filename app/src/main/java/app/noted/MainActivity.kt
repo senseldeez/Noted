@@ -14,6 +14,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -38,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import app.noted.ui.C
+import app.noted.ui.LineW
 import app.noted.ui.FolderScreen
 import app.noted.ui.NoteScreen
 import app.noted.ui.NotedTheme
@@ -68,12 +78,32 @@ fun App(vm: AppViewModel) {
     val top = vm.stack.lastOrNull() ?: return
     BackHandler(enabled = vm.stack.size > 1) { vm.pop() }
     val holder = rememberSaveableStateHolder()
-    holder.SaveableStateProvider(top.stateKey()) {
-        when (top) {
-            Screen.Setup -> SetupScreen(vm)
-            is Screen.Folder -> FolderScreen(vm, top.dir)
-            is Screen.Note -> NoteScreen(vm, top)
-            Screen.Search -> SearchScreen(vm)
+    // Forward: the new screen slides in a little from the right over the old one.
+    // Back: the top screen slides away and reveals the one below. Read <-> edit cross-fades.
+    AnimatedContent(
+        targetState = top to vm.stack.size,
+        contentKey = { it.first.stateKey() },
+        transitionSpec = {
+            val forward = targetState.second > initialState.second
+            val back = targetState.second < initialState.second
+            when {
+                forward -> (slideInHorizontally(tween(260, easing = FastOutSlowInEasing)) { it / 5 } + fadeIn(tween(220)))
+                    .togetherWith(slideOutHorizontally(tween(260)) { -it / 12 } + fadeOut(tween(180)))
+                back -> (slideInHorizontally(tween(260)) { -it / 12 } + fadeIn(tween(220)))
+                    .togetherWith(slideOutHorizontally(tween(240, easing = FastOutSlowInEasing)) { it / 5 } + fadeOut(tween(200)))
+                    .apply { targetContentZIndex = -1f }
+                else -> fadeIn(tween(200)).togetherWith(fadeOut(tween(160)))
+            }.using(SizeTransform(clip = false))
+        },
+        label = "screens",
+    ) { (screen, _) ->
+        holder.SaveableStateProvider(screen.stateKey()) {
+            when (screen) {
+                Screen.Setup -> SetupScreen(vm)
+                is Screen.Folder -> FolderScreen(vm, screen.dir)
+                is Screen.Note -> NoteScreen(vm, screen)
+                Screen.Search -> SearchScreen(vm)
+            }
         }
     }
 }
@@ -107,7 +137,7 @@ private fun SetupScreen(vm: AppViewModel) {
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Spacer(Modifier.height(24.dp))
-        Text("Noted", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        Text("Noted", fontSize = 28.sp, fontWeight = FontWeight.ExtraBold)
         Text(
             "Your notes are plain .md files in a folder on your phone. Folders here are real folders, " +
                 "so you can point a sync app (FolderSync, Autosync for Google Drive) at the same folder.",
@@ -140,7 +170,7 @@ private fun SetupScreen(vm: AppViewModel) {
 @Composable
 private fun Step(n: String, title: String, body: String) {
     Column(
-        Modifier.fillMaxWidth().border(1.dp, C.Border, RoundedCornerShape(20.dp)).padding(16.dp),
+        Modifier.fillMaxWidth().border(LineW, C.Border, RoundedCornerShape(20.dp)).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold)

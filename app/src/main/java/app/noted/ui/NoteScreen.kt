@@ -4,7 +4,10 @@ import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -97,26 +100,26 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
             val t = text ?: return@Column
             Column(
                 Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                    .padding(start = 22.dp, end = 22.dp, top = 8.dp, bottom = 120.dp),
+                    .padding(start = 30.dp, end = 22.dp, top = 8.dp, bottom = 120.dp),
             ) {
                 if (!startsWithH1(t)) {
                     Text(
-                        file.name.removeMdExtension(), fontSize = 24.sp, lineHeight = 30.sp,
-                        fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp,
+                        file.name.removeMdExtension(), fontSize = 26.sp, lineHeight = 32.sp,
+                        fontWeight = FontWeight.ExtraBold, letterSpacing = (-0.4).sp,
                         modifier = Modifier.padding(bottom = 14.dp),
                     )
                 }
                 if (t.isBlank()) {
                     Text("Empty note. Tap the pencil to start writing.", fontSize = 13.sp, color = C.Muted)
                 } else {
-                    MarkdownReader(t, onToggleTask = { line ->
+                    MarkdownReader(t, folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) }, onToggleTask = { line ->
                         val nt = toggleTaskLine(t, line)
                         text = nt
                         scope.launch(Dispatchers.IO) { writeSafe(file, nt); modified = file.lastModified() }
                     })
                 }
                 Spacer(Modifier.height(18.dp))
-                Box(Modifier.fillMaxWidth().height(1.dp).background(C.Divider))
+                Box(Modifier.fillMaxWidth().height(2.dp).background(C.Divider))
                 val words = wordCount(t)
                 val ago = if (modified > 0) DateUtils.getRelativeTimeSpanString(modified, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS).toString().lowercase() else ""
                 Text(
@@ -181,14 +184,15 @@ private fun EditScreen(vm: AppViewModel, file: File) {
         }
     }
 
-    fun done() {
+    fun save(then: () -> Unit) {
         val t = value?.text
         scope.launch {
             if (t != null && t != saved) withContext(Dispatchers.IO) { writeSafe(file, t) }
             if (t != null) saved = t
-            vm.replaceTop(Screen.Note(file, editing = false))
+            then()
         }
     }
+    fun done() = save { vm.replaceTop(Screen.Note(file, editing = false)) }
     BackHandler { done() }
 
     fun change(next: TextFieldValue, force: Boolean = false) {
@@ -202,7 +206,7 @@ private fun EditScreen(vm: AppViewModel, file: File) {
         val h = history
         h?.version // read so undo/redo enablement recomposes
         Row(Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconBtn(Icons.Back, "Done editing") { done() }
+            IconBtn(Icons.Back, "Back to folder") { save { vm.pop() } }
             Text(
                 if (v == null || v.text == saved) "Saved" else "Editing",
                 fontSize = 12.sp, color = C.Muted, modifier = Modifier.weight(1f),
@@ -215,20 +219,26 @@ private fun EditScreen(vm: AppViewModel, file: File) {
                 val cur = value ?: return@IconBtn
                 h?.redo(cur)?.let { value = it }
             }
+            Spacer(Modifier.width(6.dp))
+            ReadButton { done() }
         }
         if (v == null) return@Column
         Column(
             Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
-                .padding(start = 22.dp, end = 22.dp, top = 8.dp, bottom = 24.dp),
+                .padding(start = 30.dp, end = 22.dp, top = 8.dp, bottom = 24.dp),
         ) {
             if (!startsWithH1(v.text)) {
                 Text(
-                    file.name.removeMdExtension(), fontSize = 24.sp, lineHeight = 30.sp,
-                    fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp, color = C.White,
+                    file.name.removeMdExtension(), fontSize = 26.sp, lineHeight = 32.sp,
+                    fontWeight = FontWeight.ExtraBold, letterSpacing = (-0.4).sp, color = C.White,
                     modifier = Modifier.padding(bottom = 14.dp),
                 )
             }
-            LiveEditor(v, { change(it) }, focus, Modifier.fillMaxWidth())
+            LiveEditor(
+                v, { change(it) }, focus,
+                folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
+                modifier = Modifier.fillMaxWidth(),
+            )
             // Tapping below the text focuses the end of the note.
             Spacer(
                 Modifier.fillMaxWidth().height(240.dp).clickable(indication = null, interactionSource = null) {
@@ -238,5 +248,20 @@ private fun EditScreen(vm: AppViewModel, file: File) {
             )
         }
         FormatToolbar(v, { change(it, force = true) }, Modifier.padding(bottom = 8.dp))
+    }
+}
+
+/** Solid pill at the top of the editor: jump straight back to reading mode. */
+@Composable
+private fun ReadButton(onClick: () -> Unit) {
+    Row(
+        Modifier.height(40.dp).clip(RoundedCornerShape(20.dp)).background(C.White)
+            .clickable(onClickLabel = "Back to reading mode", onClick = onClick)
+            .padding(start = 12.dp, end = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(Icons.Read, null, tint = C.Black, modifier = Modifier.size(18.dp))
+        Text("Read", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = C.Black)
     }
 }

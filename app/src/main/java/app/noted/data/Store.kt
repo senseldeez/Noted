@@ -128,7 +128,7 @@ object Store {
     fun sanitize(name: String): String =
         name.trim().replace(Regex("[\\\\/:*?\"<>|\\n\\r\\t]"), "-").trimStart('.').ifBlank { "Untitled" }
 
-    private fun uniqueFile(dir: File, base: String, ext: String): File {
+    fun uniqueFile(dir: File, base: String, ext: String): File {
         var f = File(dir, base + ext)
         var i = 2
         while (f.exists()) {

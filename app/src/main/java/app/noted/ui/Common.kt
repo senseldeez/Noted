@@ -69,7 +69,7 @@ fun PillButton(text: String, primary: Boolean, modifier: Modifier = Modifier, on
         modifier
             .heightIn(min = 44.dp)
             .clip(RoundedCornerShape(22.dp))
-            .then(if (primary) Modifier.background(C.White) else Modifier.border(1.dp, C.Border, RoundedCornerShape(22.dp)))
+            .then(if (primary) Modifier.background(C.White) else Modifier.border(LineW, C.Border, RoundedCornerShape(22.dp)))
             .clickable(onClick = onClick)
             .padding(horizontal = 18.dp, vertical = 11.dp),
         contentAlignment = Alignment.Center,
@@ -83,7 +83,7 @@ fun Menu(expanded: Boolean, onDismiss: () -> Unit, items: List<Pair<String, () -
     DropdownMenu(
         expanded = expanded, onDismissRequest = onDismiss,
         containerColor = Color(0xFF141414), shape = RoundedCornerShape(16.dp),
-        modifier = Modifier.border(1.dp, C.Border, RoundedCornerShape(16.dp)),
+        modifier = Modifier.border(LineW, C.Border, RoundedCornerShape(16.dp)),
     ) {
         items.forEach { (label, action) ->
             DropdownMenuItem(
@@ -107,14 +107,14 @@ fun NameDialog(title: String, initial: String, confirm: String, onDismiss: () ->
         text = {
             BasicTextField(
                 value = value, onValueChange = { value = it }, singleLine = true,
-                textStyle = TextStyle(fontFamily = Mono, fontSize = 15.sp, color = C.White),
+                textStyle = TextStyle(fontFamily = Sans, fontSize = 15.sp, color = C.White),
                 cursorBrush = SolidColor(C.White),
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { if (value.text.isNotBlank()) onConfirm(value.text) }),
                 modifier = Modifier.fillMaxWidth().focusRequester(fr),
                 decorationBox = { inner ->
                     Box(
-                        Modifier.fillMaxWidth().border(1.dp, C.Border, RoundedCornerShape(14.dp)).padding(14.dp),
+                        Modifier.fillMaxWidth().border(LineW, C.Border, RoundedCornerShape(14.dp)).padding(14.dp),
                     ) { inner() }
                 },
             )

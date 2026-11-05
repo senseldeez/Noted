@@ -140,7 +140,7 @@ fun classifyLine(l: String): LineInfo {
 /* ---------- Reader blocks ---------- */
 
 sealed class Block {
-    data class Heading(val level: Int, val text: String) : Block()
+    data class Heading(val level: Int, val text: String, val raw: String) : Block()
     data class Paragraph(val text: String) : Block()
     data class Quote(val text: String) : Block()
     data class Code(val text: String) : Block()
@@ -165,7 +165,7 @@ fun parseBlocks(src: String): List<Block> {
         val l = lines[i]
         when (info.kind) {
             LineKind.BLANK -> i++
-            LineKind.HEADING -> { out += Block.Heading(info.level, l.substring(info.prefixEnd).trimEnd().trimEnd('#').trimEnd()); i++ }
+            LineKind.HEADING -> { out += Block.Heading(info.level, l.substring(info.prefixEnd).trimEnd().trimEnd('#').trimEnd(), headingKey(l)); i++ }
             LineKind.RULE -> { out += Block.Rule; i++ }
             LineKind.FENCE -> {
                 val sb = StringBuilder()
