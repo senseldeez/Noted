@@ -1,89 +1,166 @@
 //! Live-preview editor: markdown is styled in place, syntax only shows on the line being
 //! edited, which sits on a rounded grey pill. Slash menu, toolbar and list shortcuts.
-use crate::app::{Action, App};
+use crate::app::App;
 use crate::icons::{self, Icon};
 use crate::md::{self, Block};
 use crate::reader::{self, format_for};
 use crate::store::{self, Item};
 use crate::theme::*;
-use crate::widgets::MOD;
+use crate::widgets::{self, MOD};
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Key, Modifiers, Rect, Sense, Shape, Stroke, StrokeKind, TextFormat, Ui};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 const LH: f32 = 28.0;
 
+pub enum PalMode {
+    /// Opened by typing `/`; the char index of that slash. The query is the text after it.
+    Slash(usize),
+    /// Opened with Ctrl+/ or the toolbar: its own search field, applied to `at` when chosen.
+    Input { query: String, at: (usize, usize), focus: bool },
+}
+
 pub struct Palette {
-    /// Char index of the `/` that opened it.
-    pub slash: usize,
+    pub mode: PalMode,
     pub sel: usize,
-    /// The slash was typed for us (Ctrl+/ or the toolbar), so Esc removes it.
-    pub inserted: bool,
+    lastq: String,
+    opened: f64,
+    /// Selection changed by keys this frame, so the list scrolls to it.
+    scroll: bool,
+}
+
+impl Palette {
+    fn new(mode: PalMode, now: f64) -> Self {
+        Palette { mode, sel: 0, lastq: String::new(), opened: now, scroll: true }
+    }
+    pub fn is_input(&self) -> bool {
+        matches!(self.mode, PalMode::Input { .. })
+    }
+}
+
+#[derive(Clone)]
+struct Snap {
+    text: String,
+    sel: (usize, usize),
 }
 
 pub struct Editor {
     pub path: PathBuf,
     pub title: String,
-    saved_title: String,
     pub text: String,
     saved_text: String,
     pub dirty_since: Option<f64>,
     pub palette: Option<Palette>,
-    pub focus_title: bool,
-    pub is_new: bool,
     focus_body: bool,
+    start_cursor: Option<usize>,
     last_sel: Option<(usize, usize)>,
     boxes: Vec<(Rect, usize)>,
     /// Input that arrived after a key we handled, replayed next frame so keys apply in order.
     pending: Vec<egui::Event>,
+    hist: Vec<Snap>,
+    fut: Vec<Snap>,
+    last_push: f64,
+    snap: Snap,
+    scrolled_for: Option<usize>,
+    had_focus: bool,
 }
 
 impl Editor {
-    pub fn new(item: &Item) -> Self {
+    /// Open `item` with the cursor at the end of `line` (or of the last line).
+    pub fn new(item: &Item, line: Option<usize>) -> Self {
+        let text = item.text.trim_end_matches('\n').to_string();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let li = line.unwrap_or(lines.len().saturating_sub(1)).min(lines.len().saturating_sub(1));
+        let cur: usize = lines[..li].iter().map(|l| l.chars().count() + 1).sum::<usize>() + lines[li].chars().count();
         Editor {
             path: item.path.clone(),
             title: item.name.clone(),
-            saved_title: item.name.clone(),
-            text: item.text.clone(),
-            saved_text: item.text.clone(),
+            saved_text: text.clone(),
+            snap: Snap { text: text.clone(), sel: (cur, cur) },
+            text,
             dirty_since: None,
             palette: None,
-            focus_title: false,
-            is_new: false,
             focus_body: true,
+            start_cursor: Some(cur),
             last_sel: None,
             boxes: vec![],
             pending: vec![],
+            hist: vec![],
+            fut: vec![],
+            last_push: 0.0,
+            scrolled_for: None,
+            had_focus: true,
         }
+    }
+
+    fn file_text(&self) -> String {
+        if self.text.is_empty() { String::new() } else { format!("{}\n", self.text) }
+    }
+
+    pub fn is_saved(&self) -> bool {
+        self.text == self.saved_text
     }
 
     pub fn write_text(&mut self) -> Result<(), String> {
         self.dirty_since = None;
-        if self.text != self.saved_text {
-            store::write(&self.path, &self.text).map_err(|e| format!("Couldn't save: {e}"))?;
+        if !self.is_saved() {
+            store::write(&self.path, &self.file_text()).map_err(|e| format!("Couldn't save: {e}"))?;
             self.saved_text = self.text.clone();
         }
         Ok(())
     }
 
-    /// Write text and apply a title change. Returns the new path when the file was renamed.
+    /// Write the text. Kept returning a path for callers that follow renames.
     pub fn save(&mut self) -> Result<Option<PathBuf>, String> {
         self.write_text()?;
-        let t = self.title.trim().to_string();
-        if !t.is_empty() && t != self.saved_title {
-            match store::rename(&self.path, &t) {
-                Some(new) => {
-                    self.path = new.clone();
-                    self.saved_title = t;
-                    return Ok(Some(new));
-                }
-                None => {
-                    self.title = self.saved_title.clone();
-                    return Err("A note with that name already exists".into());
-                }
-            }
-        }
         Ok(None)
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.hist.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.fut.is_empty()
+    }
+
+    fn current(&self, ctx: &egui::Context) -> Snap {
+        let sel = egui::text_edit::TextEditState::load(ctx, editor_id(&self.path))
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.secondary.index.0, r.primary.index.0))
+            .or(self.last_sel)
+            .unwrap_or((0, 0));
+        Snap { text: self.text.clone(), sel }
+    }
+
+    fn restore(&mut self, ctx: &egui::Context, s: Snap) {
+        self.text = s.text.clone();
+        let n = self.text.chars().count();
+        let (a, b) = (s.sel.0.min(n), s.sel.1.min(n));
+        set_cursor(ctx, editor_id(&self.path), a, b);
+        ctx.memory_mut(|m| m.request_focus(editor_id(&self.path)));
+        self.last_sel = Some((a, b));
+        self.snap = Snap { text: self.text.clone(), sel: (a, b) };
+        self.palette = None;
+        self.dirty_since = Some(ctx.input(|i| i.time));
+        self.last_push = 0.0;
+        ctx.request_repaint();
+    }
+
+    pub fn undo(&mut self, ctx: &egui::Context) {
+        if let Some(s) = self.hist.pop() {
+            let cur = self.current(ctx);
+            self.fut.push(cur);
+            self.restore(ctx, s);
+        }
+    }
+
+    pub fn redo(&mut self, ctx: &egui::Context) {
+        if let Some(s) = self.fut.pop() {
+            let cur = self.current(ctx);
+            self.hist.push(cur);
+            self.restore(ctx, s);
+        }
     }
 }
 
@@ -155,13 +232,13 @@ pub fn apply(text: &mut String, sel: (usize, usize), cmd: Cmd, from_menu: bool) 
         Cmd::Link => {
             let inner = text[ba..bb].to_string();
             if inner.is_empty() {
-                text.replace_range(ba..bb, "[text](url)");
-                (a + 1, a + 5)
+                text.replace_range(ba..bb, "[link text](https://)");
+                (a + 1, a + 10)
             } else {
-                let s = format!("[{inner}](url)");
+                let s = format!("[{inner}](https://)");
                 text.replace_range(ba..bb, &s);
                 let n = inner.chars().count();
-                (a + n + 3, a + n + 6)
+                (a + n + 3, a + n + 11)
             }
         }
         Cmd::Divider => {
@@ -251,7 +328,11 @@ pub fn apply(text: &mut String, sel: (usize, usize), cmd: Cmd, from_menu: bool) 
                 (x, y) => x == y,
             };
             let toggle_off = !from_menu && cmd != Cmd::HeadingCycle && same(cur.block);
-            let mut n = 0;
+            // Picking a list type from the menu on a line that already has it changes nothing.
+            if from_menu && same(cur.block) && matches!(target, Block::Bullet | Block::Number | Block::Task(_) | Block::Quote) {
+                return (a, b);
+            }
+            let mut n = prev_num(text, ls);
             let mut first_delta: i64 = 0;
             let mut total: i64 = 0;
             let out: Vec<String> = lines
@@ -301,6 +382,22 @@ pub fn apply(text: &mut String, sel: (usize, usize), cmd: Cmd, from_menu: bool) 
     }
 }
 
+/// Number of the numbered item just above `ls` (skipping blank lines), or 0.
+fn prev_num(text: &str, ls: usize) -> u64 {
+    for l in text[..ls].split('\n').rev().skip(1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let c = md::classify(l);
+        if c.block == Block::Number {
+            let m = l[c.marker.clone()].trim();
+            return m.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0);
+        }
+        return 0;
+    }
+    0
+}
+
 /// Enter on a list line continues the list; on an empty item it ends it.
 fn enter_continues(text: &mut String, at: usize) -> Option<usize> {
     let b = byte_at(text, at);
@@ -315,7 +412,7 @@ fn enter_continues(text: &mut String, at: usize) -> Option<usize> {
     let next = match c.block {
         Block::Bullet => format!("{}{} ", &line[..c.indent], &line[c.indent..c.indent + 1]),
         Block::Task(_) => format!("{}- [ ] ", &line[..c.indent]),
-        Block::Quote => format!("{}> ", &line[..c.indent]),
+        Block::Quote => "> ".to_string(),
         Block::Number => {
             let m = line[c.marker.clone()].trim();
             let digits: String = m.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -329,12 +426,7 @@ fn enter_continues(text: &mut String, at: usize) -> Option<usize> {
         return None;
     }
     if line[c.content.clone()].trim().is_empty() {
-        // Empty item: drop the marker (outdent first if nested).
-        if c.indent > 0 {
-            let cut = if line.starts_with('\t') { 1 } else { c.indent.min(2) };
-            text.replace_range(ls..ls + cut, "");
-            return Some(at - cut);
-        }
+        // Empty item: clear the line.
         text.replace_range(ls..le, "");
         return Some(char_at(text, ls));
     }
@@ -448,97 +540,167 @@ fn heading_font(level: u8) -> FontId {
     }
 }
 
-/// Style the whole note. `active` is the line holding the cursor.
-fn build(text: &str, active: Option<usize>, wrap: f32) -> (LayoutJob, Vec<Deco>) {
+/// Note starts with a `# ` heading, which then stands in for the title.
+pub fn starts_with_h1(text: &str) -> bool {
+    text.lines().find(|l| !l.trim().is_empty()).map(|l| l.starts_with("# ") || l.trim() == "#").unwrap_or(false)
+}
+
+/// First line after the section that heading `i` starts.
+pub fn section_end(lines: &[&str], i: usize) -> usize {
+    let lv = match md::classify(lines[i]).block {
+        Block::Heading(l) => l,
+        _ => return i + 1,
+    };
+    let mut fence = false;
+    for (j, l) in lines.iter().enumerate().skip(i + 1) {
+        let c = md::classify(l);
+        if c.block == Block::Fence {
+            fence = !fence;
+            continue;
+        }
+        if !fence {
+            if let Block::Heading(h) = c.block {
+                if h <= lv {
+                    return j;
+                }
+            }
+        }
+    }
+    lines.len()
+}
+
+/// Lines hidden under folded headings, and the visible foldable headings with their state.
+fn fold_info(lines: &[&str], folds: &HashSet<String>) -> (HashSet<usize>, Vec<(usize, bool)>) {
+    let mut hidden = HashSet::new();
+    let mut heads = Vec::new();
+    let mut fence = false;
+    for i in 0..lines.len() {
+        let c = md::classify(lines[i]);
+        if c.block == Block::Fence {
+            fence = !fence;
+            continue;
+        }
+        if fence || hidden.contains(&i) || !matches!(c.block, Block::Heading(_)) {
+            continue;
+        }
+        let end = section_end(lines, i);
+        if !lines[i + 1..end].iter().any(|l| !l.trim().is_empty()) {
+            continue;
+        }
+        let closed = folds.contains(lines[i].trim());
+        heads.push((i, closed));
+        if closed {
+            hidden.extend(i + 1..end);
+        }
+    }
+    (hidden, heads)
+}
+
+type Measure<'a> = &'a dyn Fn(&str, &FontId) -> f32;
+
+/// Format that stretches or squeezes `text` to exactly `target` pixels.
+fn spaced(text: &str, font: FontId, color: Color32, target: f32, m: Measure) -> TextFormat {
+    let n = text.chars().count().max(1) as f32;
+    let mut f = fmt(font.clone(), color);
+    f.extra_letter_spacing = (target - m(text, &font)) / n;
+    f
+}
+
+/// Style the whole note. `active` is the line holding the cursor: it shows as plain text.
+fn build(text: &str, active: Option<usize>, hidden: &HashSet<usize>, wrap: f32, m: Measure) -> (LayoutJob, Vec<Deco>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
     let mut decos = Vec::new();
-    let hidden = fmt(sans(1.0), Color32::TRANSPARENT);
+    let hidden_fmt = fmt(sans(1.0), Color32::TRANSPARENT);
+    let gone = TextFormat { font_id: sans(1.0), color: Color32::TRANSPARENT, line_height: Some(0.0), ..Default::default() };
     let mut chars = 0usize;
     let mut in_code = false;
-    let mut code_start: Option<usize> = None;
     let all: Vec<&str> = text.split('\n').collect();
     let n = all.len();
     for (li, line) in all.iter().enumerate() {
         let is_active = active == Some(li);
         let lc = line.chars().count();
         let c = md::classify(line);
+        let is_fence = c.block == Block::Fence;
+        let code_line = is_fence || in_code;
+        let opening = is_fence && !in_code;
+        let closing = is_fence && in_code;
+        if opening {
+            in_code = true;
+        }
         let nl_fmt;
-        if c.block == Block::Fence || in_code {
-            let opening = c.block == Block::Fence && !in_code;
-            let closing = c.block == Block::Fence && in_code;
-            if opening {
-                in_code = true;
-                code_start = Some(decos.len());
-            }
-            let color = if c.block == Block::Fence { SYNTAX } else { TEXT2 };
+        if hidden.contains(&li) {
+            job.append(line, 0.0, gone.clone());
+            nl_fmt = gone.clone();
+        } else if code_line {
+            let color = if is_active { WHITE } else if is_fence { SYNTAX } else { TEXT2 };
             let f = fmt(mono(13.0), color);
             job.append(line, 0.0, f.clone());
             decos.push(Deco { line: li, at: chars, end: chars + lc, kind: DecoKind::Code { first: opening, last: closing || li == n - 1 } });
-            if closing {
-                in_code = false;
-                code_start = None;
-            }
+            nl_fmt = f;
+        } else if is_active {
+            let base = match c.block {
+                Block::Heading(l) => heading_font(l),
+                _ => sans(16.0),
+            };
+            let f = fmt(base, WHITE);
+            job.append(line, 0.0, f.clone());
             nl_fmt = f;
         } else {
             let (base, color) = match c.block {
                 Block::Heading(l) => (heading_font(l), WHITE),
                 Block::Bullet | Block::Number | Block::Task(_) => (sans(16.0), WHITE),
-                Block::Quote if !is_active => (italic(16.0), TEXT3),
-                _ => (sans(16.0), if is_active { WHITE } else { TEXT2 }),
+                Block::Quote => (italic(16.0), TEXT3),
+                _ => (sans(16.0), TEXT2),
             };
             let done = matches!(c.block, Block::Task(true));
-            // Indent
             if c.indent > 0 {
-                // Widen indent spaces so each nesting level steps in like the reader.
-                let mut f = fmt(sans(16.0), color);
-                f.extra_letter_spacing = 9.5;
-                job.append(&line[..c.indent], 0.0, f);
-            }
-            // Block marker
-            let marker = &line[c.marker.clone()];
-            if !marker.is_empty() || c.block == Block::Rule {
-                let at = chars + line[..c.marker.start].chars().count();
-                if is_active {
-                    job.append(marker, 0.0, fmt(base.clone(), SYNTAX));
+                let ind = &line[..c.indent];
+                if matches!(c.block, Block::Bullet | Block::Number | Block::Task(_)) {
+                    // Each nesting level steps in 22px, like the reader.
+                    job.append(ind, 0.0, spaced(ind, sans(16.0), color, c.level(line) as f32 * 22.0, m));
                 } else {
-                    match c.block {
-                        Block::Heading(_) => job.append(marker, 0.0, hidden.clone()),
-                        Block::Number => job.append(marker, 0.0, fmt(sans(16.0), MUTED)),
-                        Block::Bullet => {
-                            job.append(marker, 0.0, fmt(base.clone(), Color32::TRANSPARENT));
-                            decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Dot });
-                        }
-                        Block::Task(d) => {
-                            let mut f = fmt(base.clone(), Color32::TRANSPARENT);
-                            f.extra_letter_spacing = -2.0;
-                            job.append(marker, 0.0, f);
-                            decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Box(d) });
-                        }
-                        Block::Quote => {
-                            job.append(marker, 0.0, fmt(base.clone(), Color32::TRANSPARENT));
-                            decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Bar });
-                        }
-                        Block::Rule => {
-                            decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Rule });
-                        }
-                        _ => job.append(marker, 0.0, fmt(base.clone(), SYNTAX)),
+                    job.append(ind, 0.0, fmt(sans(16.0), color));
+                }
+            }
+            let marker = &line[c.marker.clone()];
+            let at = chars + line[..c.marker.start].chars().count();
+            match c.block {
+                Block::Heading(_) => job.append(marker, 0.0, hidden_fmt.clone()),
+                Block::Number => {
+                    let t = marker.trim_end();
+                    job.append(t, 0.0, fmt(sans(15.0), MUTED));
+                    let sp = &marker[t.len()..];
+                    if !sp.is_empty() {
+                        job.append(sp, 0.0, spaced(sp, sans(16.0), MUTED, 8.0, m));
+                    }
+                }
+                Block::Bullet => {
+                    job.append(marker, 0.0, spaced(marker, sans(16.0), Color32::TRANSPARENT, 15.0, m));
+                    decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Dot });
+                }
+                Block::Task(d) => {
+                    job.append(marker, 0.0, spaced(marker, sans(16.0), Color32::TRANSPARENT, 26.0, m));
+                    decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Box(d) });
+                }
+                Block::Quote => {
+                    job.append(marker, 0.0, spaced(marker, sans(16.0), Color32::TRANSPARENT, 17.0, m));
+                    decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Bar });
+                }
+                Block::Rule => decos.push(Deco { line: li, at, end: chars + lc, kind: DecoKind::Rule }),
+                _ => {
+                    if !marker.is_empty() {
+                        job.append(marker, 0.0, fmt(base.clone(), SYNTAX))
                     }
                 }
             }
-            // Content
             if c.block == Block::Rule {
-                let f = if is_active { fmt(base.clone(), SYNTAX) } else { fmt(base.clone(), Color32::TRANSPARENT) };
-                job.append(&line[c.indent..], 0.0, f);
+                job.append(&line[c.indent..], 0.0, fmt(base.clone(), Color32::TRANSPARENT));
             } else {
                 for sp in md::inline(line, c.content.clone()) {
                     let t = &line[sp.range.clone()];
                     if sp.style.marker {
-                        if is_active {
-                            job.append(t, 0.0, fmt(base.clone(), SYNTAX));
-                        } else {
-                            job.append(t, 0.0, hidden.clone());
-                        }
+                        job.append(t, 0.0, hidden_fmt.clone());
                         continue;
                     }
                     let mut f = format_for(sp.style, &base, color, LH);
@@ -551,20 +713,14 @@ fn build(text: &str, active: Option<usize>, wrap: f32) -> (LayoutJob, Vec<Deco>)
             }
             nl_fmt = fmt(base, color);
         }
+        if closing {
+            in_code = false;
+        }
         chars += lc;
         if li + 1 < n {
             job.append("\n", 0.0, nl_fmt);
             chars += 1;
         }
-    }
-    // An unclosed fence runs to the end of the note.
-    if let Some(i) = code_start {
-        if let Some(d) = decos.last_mut() {
-            if let DecoKind::Code { last, .. } = &mut d.kind {
-                *last = true;
-            }
-        }
-        let _ = i;
     }
     if job.text.is_empty() {
         job.append("", 0.0, fmt(sans(16.0), TEXT2));
@@ -600,24 +756,59 @@ fn styles_at(text: &str, at: usize) -> (Block, bool, bool, bool) {
     st
 }
 
+/// Key hint chip drawn from its left edge; returns its width.
+fn chip(p: &egui::Painter, x: f32, cy: f32, text: &str) -> f32 {
+    let g = p.layout_no_wrap(text.into(), mono(11.0), TEXT2);
+    let w = g.size().x + 10.0;
+    let r = Rect::from_min_size(pos2(x, cy - 9.0), vec2(w, 18.0));
+    p.rect_stroke(r, 6, Stroke::new(LINE, BORDER), StrokeKind::Inside);
+    p.galley(pos2(r.min.x + 5.0, r.center().y - g.size().y / 2.0), g, TEXT2);
+    w
+}
+
+enum Tool {
+    Btn(Result<Icon, &'static str>, Cmd, bool, &'static str, String),
+    Sep,
+    Slash,
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
     let now = ctx.input(|i| i.time);
-    let Some(e) = app.editor.as_mut() else { return };
+    let Some(path) = app.editor.as_ref().map(|e| e.path.clone()) else { return };
+    let folds: HashSet<String> = app.folds.get(&path).cloned().unwrap_or_default();
+    let mut fold_toggle: Option<String> = None;
+    let e = app.editor.as_mut().unwrap();
     let id = editor_id(&e.path);
-    let title_id = Id::new(("title", &e.path));
     let rect = ui.max_rect();
+
+    // First frame: focus the text with the cursor where the note was opened.
+    if let Some(c) = e.start_cursor.take() {
+        set_cursor(&ctx, id, c, c);
+        ctx.memory_mut(|m| m.request_focus(id));
+        e.last_sel = Some((c, c));
+        e.snap.sel = (c, c);
+    }
     let focused = ctx.memory(|m| m.has_focus(id));
+    let mut focused = focused;
+    // egui drops focus on Escape before we see the key; keep it while the slash menu uses Esc.
+    let esc = ctx.input(|i| i.events.iter().any(|ev| matches!(ev, egui::Event::Key { key: Key::Escape, pressed: true, .. })));
+    if !focused && esc && e.had_focus && ctx.memory(|m| m.focused().is_none()) {
+        ctx.memory_mut(|m| m.request_focus(id));
+        focused = true;
+    }
     let state = egui::text_edit::TextEditState::load(&ctx, id);
-    let sel = state.as_ref().and_then(|s| s.cursor.char_range()).map(|r| (r.secondary.index.0, r.primary.index.0));
+    let mut sel = state.as_ref().and_then(|s| s.cursor.char_range()).map(|r| (r.secondary.index.0, r.primary.index.0));
     if focused {
         if let Some(s) = sel {
             e.last_sel = Some(s);
         }
     }
-    let cursor = sel.map(|s| s.1).or(e.last_sel.map(|s| s.1)).unwrap_or(0);
+    let mut cursor = sel.map(|s| s.1).or(e.last_sel.map(|s| s.1)).unwrap_or(0);
     let mut new_sel: Option<(usize, usize)> = None;
     let mut changed = false;
+    let mut force_hist = false;
+    let mut refocus = false;
 
     // A click on a checkbox ticks it without moving the cursor.
     let mut tick: Option<usize> = None;
@@ -627,9 +818,55 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
     }
 
+    // The palette with its own search field takes the arrow keys, Enter and Esc first.
+    let mut input_choice: Option<(Cmd, (usize, usize))> = None;
+    let mut input_close: Option<(usize, usize)> = None;
+    if let Some(p) = &mut e.palette {
+        if let PalMode::Input { query, at, .. } = &p.mode {
+            let list = matches(query);
+            let (up, down, tab, stab, enter, esc) = ctx.input_mut(|i| {
+                let stab = i.consume_key(Modifiers::SHIFT, Key::Tab);
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::Tab),
+                    stab,
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            });
+            if !list.is_empty() {
+                if down || tab {
+                    p.sel = (p.sel + 1) % list.len();
+                    p.scroll = true;
+                }
+                if up || stab {
+                    p.sel = (p.sel + list.len() - 1) % list.len();
+                    p.scroll = true;
+                }
+                if enter {
+                    input_choice = Some((list[p.sel.min(list.len() - 1)].cmd, *at));
+                }
+            }
+            if esc {
+                input_close = Some(*at);
+            }
+        }
+    }
+    if let Some((c, at)) = input_choice {
+        e.palette = None;
+        new_sel = Some(apply(&mut e.text, at, c, true));
+        changed = true;
+        force_hist = true;
+        refocus = true;
+    }
+    if let Some(at) = input_close {
+        e.palette = None;
+        new_sel = Some(at);
+        refocus = true;
+    }
+
     // Keys the editor handles itself, before the text field sees them.
-    let mut cursor = cursor;
-    let mut sel = sel;
     let mut deferred: Vec<egui::Event> = Vec::new();
     if focused && !e.pending.is_empty() {
         let mut replay = std::mem::take(&mut e.pending);
@@ -646,7 +883,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let flushed: String = ctx.input_mut(|i| {
             let first_key = i.events.iter().position(|ev| match ev {
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    matches!(key, Key::Enter | Key::Tab | Key::ArrowUp | Key::ArrowDown | Key::Escape) || modifiers.command
+                    matches!(key, Key::Enter | Key::Tab | Key::ArrowUp | Key::ArrowDown | Key::Escape | Key::Backspace) || modifiers.command
                 }
                 _ => false,
             });
@@ -686,7 +923,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     let before = if slash == 0 { None } else { e.text.chars().nth(slash - 1) };
                     let tail = &flushed[rel + 1..];
                     if matches!(before, None | Some(' ') | Some('\n') | Some('\t')) && !tail.contains(' ') {
-                        e.palette = Some(Palette { slash, sel: 0, inserted: false });
+                        e.palette = Some(Palette::new(PalMode::Slash(slash), now));
                     }
                 }
             }
@@ -697,42 +934,47 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
         let s = sel.unwrap_or((cursor, cursor));
         let cmd = Modifiers::COMMAND;
-        if let Some(p) = &mut e.palette {
+        let slash_pal = e.palette.as_ref().and_then(|p| if let PalMode::Slash(sl) = p.mode { Some(sl) } else { None });
+        if let Some(slash) = slash_pal {
+            let p = e.palette.as_mut().unwrap();
             let q_end = cursor;
-            let q: String = e.text.chars().skip(p.slash + 1).take(q_end.saturating_sub(p.slash + 1)).collect();
+            let q: String = e.text.chars().skip(slash + 1).take(q_end.saturating_sub(slash + 1)).collect();
             let list = matches(&q);
             let (up, down, tab, stab, enter, esc) = ctx.input_mut(|i| {
+                let stab = i.consume_key(Modifiers::SHIFT, Key::Tab);
                 (
                     i.consume_key(Modifiers::NONE, Key::ArrowUp),
                     i.consume_key(Modifiers::NONE, Key::ArrowDown),
                     i.consume_key(Modifiers::NONE, Key::Tab),
-                    i.consume_key(Modifiers::SHIFT, Key::Tab),
+                    stab,
                     i.consume_key(Modifiers::NONE, Key::Enter),
                     i.consume_key(Modifiers::NONE, Key::Escape),
                 )
             });
             if !list.is_empty() {
                 if down || tab {
-                    p.sel = (p.sel + 1) % list.len()
+                    p.sel = (p.sel + 1) % list.len();
+                    p.scroll = true;
                 }
                 if up || stab {
-                    p.sel = (p.sel + list.len() - 1) % list.len()
+                    p.sel = (p.sel + list.len() - 1) % list.len();
+                    p.scroll = true;
                 }
             }
             if esc {
-                if p.inserted {
-                    let b = byte_at(&e.text, p.slash);
-                    e.text.replace_range(b..b + 1, "");
-                    new_sel = Some((cursor - 1, cursor - 1));
-                    changed = true;
-                }
+                // Keep the typed `/` as plain text.
                 e.palette = None;
             } else if enter {
                 if let Some(c) = list.get(p.sel.min(list.len().saturating_sub(1))) {
-                    let (b0, b1) = (byte_at(&e.text, p.slash), byte_at(&e.text, q_end));
+                    let (b0, b1) = (byte_at(&e.text, slash), byte_at(&e.text, q_end));
+                    // Record the literal text first so undo brings it back.
+                    e.hist.push(Snap { text: e.text.clone(), sel: (q_end, q_end) });
+                    e.fut.clear();
                     e.text.replace_range(b0..b1, "");
-                    new_sel = Some(apply(&mut e.text, (p.slash, p.slash), c.cmd, true));
+                    e.snap = Snap { text: e.text.clone(), sel: (slash, slash) };
+                    new_sel = Some(apply(&mut e.text, (slash, slash), c.cmd, true));
                     changed = true;
+                    force_hist = true;
                 }
                 e.palette = None;
             }
@@ -745,6 +987,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 run = Some(Cmd::Italic)
             } else if k(cmd, Key::K) {
                 run = Some(Cmd::Link)
+            } else if k(cmd, Key::Backtick) {
+                run = Some(Cmd::Code)
+            } else if k(cmd | Modifiers::SHIFT, Key::X) {
+                run = Some(Cmd::Strike)
+            } else if k(cmd | Modifiers::SHIFT, Key::Period) || k(cmd | Modifiers::SHIFT, Key::Colon) {
+                run = Some(Cmd::Quote)
             } else if k(cmd | Modifiers::ALT, Key::Num1) {
                 run = Some(Cmd::H(1))
             } else if k(cmd | Modifiers::ALT, Key::Num2) {
@@ -765,12 +1013,15 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             if let Some(c) = run {
                 new_sel = Some(apply(&mut e.text, s, c, false));
                 changed = true;
+                force_hist = true;
+            } else if k(cmd | Modifiers::SHIFT, Key::Z) || k(cmd, Key::Y) {
+                e.redo(&ctx);
+                new_sel = Some(e.snap.sel);
+            } else if k(cmd, Key::Z) {
+                e.undo(&ctx);
+                new_sel = Some(e.snap.sel);
             } else if k(cmd, Key::Slash) {
-                let b = byte_at(&e.text, s.1);
-                e.text.insert(b, '/');
-                e.palette = Some(Palette { slash: s.1, sel: 0, inserted: true });
-                new_sel = Some((s.1 + 1, s.1 + 1));
-                changed = true;
+                e.palette = Some(Palette::new(PalMode::Input { query: String::new(), at: s, focus: true }, now));
             } else if s.0 == s.1 && ctx.input(|i| i.key_pressed(Key::Enter) && i.modifiers.is_none()) {
                 let mut t = e.text.clone();
                 if let Some(c) = enter_continues(&mut t, s.1) {
@@ -779,69 +1030,70 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     new_sel = Some((c, c));
                     changed = true;
                 }
+                force_hist = true;
+            } else if s.0 == s.1 && ctx.input(|i| i.key_pressed(Key::Backspace) && i.modifiers.is_none()) {
+                // Backspace right after a list, quote or heading marker removes the marker.
+                let b = byte_at(&e.text, s.1);
+                let (ls, le) = line_bounds(&e.text, b);
+                let c = md::classify(&e.text[ls..le]);
+                if matches!(c.block, Block::Bullet | Block::Number | Block::Task(_) | Block::Quote | Block::Heading(_))
+                    && c.marker.end > c.marker.start
+                    && b - ls == c.marker.end
+                {
+                    ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace));
+                    e.text.replace_range(ls + c.marker.start..ls + c.marker.end, "");
+                    let nc = char_at(&e.text, ls + c.marker.start);
+                    new_sel = Some((nc, nc));
+                    changed = true;
+                    force_hist = true;
+                }
             }
         }
     }
     if let Some((a, b)) = new_sel {
         set_cursor(&ctx, id, a, b);
     }
-    let active = if focused || new_sel.is_some() {
-        Some(line_index(&e.text, byte_at(&e.text, new_sel.map(|s| s.1).unwrap_or(cursor))))
-    } else {
-        None
-    };
+    if refocus {
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+    let cur_now = new_sel.map(|s| s.1).unwrap_or(cursor).min(e.text.chars().count());
+    let active = Some(line_index(&e.text, byte_at(&e.text, cur_now)));
 
     let mut toolbar_cmd: Option<Cmd> = None;
-    let mut open_palette_from_toolbar = false;
+    let mut open_input = false;
     let mut pal_click: Option<Cmd> = None;
     let mut cursor_screen: Option<Rect> = None;
+    let mut pal_anchor: Option<Rect> = None;
     let mut boxes = Vec::new();
-    let mut title_enter = false;
+    let mut post_cursor = cur_now;
+    let title = if starts_with_h1(&e.text) { None } else { Some(e.title.clone()) };
 
     egui::ScrollArea::vertical().id_salt(("editor-scroll", &e.path)).auto_shrink([false, false]).show(ui, |ui| {
         let avail = ui.available_width();
         let (left, w) = reader::column(avail);
         let x0 = ui.max_rect().min.x + left;
         ui.add_space(8.0);
-        // Title
-        let top = ui.cursor().min.y;
-        let title_resp = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(x0, top), vec2(w, 200.0))), |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut e.title)
-                        .id(title_id)
-                        .font(xbold(30.0))
-                        .text_color(WHITE)
-                        .hint_text(egui::RichText::new("Title").font(xbold(30.0)).color(Color32::from_gray(0x44)))
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(w),
-                )
-            })
-            .inner;
-        if e.focus_title {
-            title_resp.request_focus();
-            if e.is_new {
-                let n = e.title.chars().count();
-                set_cursor(&ctx, title_id, 0, n);
-            }
-            e.focus_title = false;
-            e.focus_body = false;
+        if let Some(t) = &title {
+            let mut tj = widgets::simple_job(t, xbold(30.0), WHITE, w, 0);
+            tj.sections[0].format.line_height = Some(36.0);
+            let g = widgets::layout(ui, tj);
+            let (r, _) = ui.allocate_exact_size(vec2(avail, g.size().y), Sense::hover());
+            ui.painter().galley(pos2(x0, r.min.y), g, WHITE);
+            ui.add_space(16.0);
         }
-        if title_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab)) {
-            title_enter = true;
-        }
-        ui.add_space(16.0);
 
         // Body
         let top = ui.cursor().min.y;
         let bg_idx = ui.painter().add(Shape::Noop);
         let mut decos: Vec<Deco> = Vec::new();
-        let text_before = e.text.clone();
         let out = ui
             .scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(x0, top), vec2(w, f32::INFINITY))), |ui| {
                 let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                    let (job, d) = build(buf.as_str(), active, wrap);
+                    let t = buf.as_str();
+                    let lines: Vec<&str> = t.split('\n').collect();
+                    let (hidden, _) = fold_info(&lines, &folds);
+                    let m = |s: &str, f: &FontId| ui.fonts_mut(|fo| fo.layout_no_wrap(s.to_string(), f.clone(), WHITE).size().x);
+                    let (job, d) = build(t, active, &hidden, wrap, &m);
                     decos = d;
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
@@ -859,51 +1111,53 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     .show(ui)
             })
             .inner;
-        if e.focus_body {
-            out.response.response.request_focus();
-            e.focus_body = false;
-        }
-        if out.response.response.changed() || e.text != text_before {
+        if out.response.response.changed() {
             changed = true;
         }
+        post_cursor = out.cursor_range.map(|r| r.primary.index.0).unwrap_or(cur_now).min(e.text.chars().count());
         let g = out.galley.clone();
         let gp = out.galley_pos;
         let painter = ui.painter();
         let row_rect = |ci: usize| -> Rect { g.pos_from_cursor(CCursor::new(ci)).translate(gp.to_vec2()) };
+        let lines: Vec<&str> = e.text.split('\n').collect();
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut acc = 0;
+        for l in &lines {
+            starts.push(acc);
+            acc += l.chars().count() + 1;
+        }
+        let cur_line = line_index(&e.text, byte_at(&e.text, post_cursor));
 
         // Background: code blocks, then the active-line pill.
         let mut bg = Vec::new();
+        let mut block: Option<f32> = None;
         for d in &decos {
             if let DecoKind::Code { first, last } = d.kind {
                 let r0 = row_rect(d.at);
-                let r1 = row_rect(d.end);
-                let r = Rect::from_min_max(pos2(gp.x - 10.0, r0.min.y), pos2(gp.x + w + 10.0, r1.max.y));
-                let rad = egui::CornerRadius { nw: if first { 12 } else { 0 }, ne: if first { 12 } else { 0 }, sw: if last { 12 } else { 0 }, se: if last { 12 } else { 0 } };
-                bg.push(Shape::rect_filled(r, rad, CODE));
-                let st = Stroke::new(2.0, GUIDE);
-                bg.push(Shape::line_segment([pos2(r.min.x + 1.0, r.min.y + if first { 12.0 } else { 0.0 }), pos2(r.min.x + 1.0, r.max.y - if last { 12.0 } else { 0.0 })], st));
-                bg.push(Shape::line_segment([pos2(r.max.x - 1.0, r.min.y + if first { 12.0 } else { 0.0 }), pos2(r.max.x - 1.0, r.max.y - if last { 12.0 } else { 0.0 })], st));
-                if first {
-                    bg.push(Shape::rect_stroke(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + 24.0)), rad, st, StrokeKind::Inside));
+                if first || block.is_none() {
+                    block = Some(r0.min.y);
                 }
                 if last {
-                    bg.push(Shape::rect_stroke(Rect::from_min_max(pos2(r.min.x, r.max.y - 24.0), r.max), rad, st, StrokeKind::Inside));
+                    let top = block.take().unwrap_or(r0.min.y);
+                    let r1 = row_rect(d.end);
+                    let r = Rect::from_min_max(pos2(gp.x - 10.0, top), pos2(gp.x + w + 10.0, r1.max.y));
+                    bg.push(Shape::rect_filled(r, 12, CODE));
+                    bg.push(Shape::rect_stroke(r, 12, Stroke::new(2.0, GUIDE), StrokeKind::Inside));
                 }
             }
         }
-        if let Some(li) = active {
-            let b = byte_at(&e.text, cursor.min(e.text.chars().count()));
-            let (ls, le) = line_bounds(&e.text, b);
-            let r0 = row_rect(char_at(&e.text, ls));
-            let r1 = row_rect(char_at(&e.text, le));
+        {
+            let ls = starts.get(cur_line).copied().unwrap_or(0);
+            let le = ls + lines.get(cur_line).map(|l| l.chars().count()).unwrap_or(0);
+            let r0 = row_rect(ls);
+            let r1 = row_rect(le);
             let ty = ctx.animate_value_with_time(id.with("pill-top"), r0.min.y - gp.y, 0.18);
             let th = ctx.animate_value_with_time(id.with("pill-h"), (r1.max.y - r0.min.y).max(LH), 0.18);
             let pill = Rect::from_min_size(pos2(gp.x - 14.0, gp.y + ty), vec2(w + 28.0, th));
             bg.push(Shape::rect_filled(pill, 14, PILL));
-            let _ = li;
-            cursor_screen = Some(row_rect(cursor));
+            cursor_screen = Some(row_rect(post_cursor));
         }
-        painter.set(bg_idx, Shape::Vec(bg));
+        ui.painter().set(bg_idx, Shape::Vec(bg));
 
         // Foreground decorations replace the hidden markers.
         for d in &decos {
@@ -911,19 +1165,17 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             let cy = r.min.y + LH / 2.0;
             match d.kind {
                 DecoKind::Dot => {
-                    painter.circle_filled(pos2(r.min.x + 3.0, cy), 2.6, WHITE);
+                    painter.circle_filled(pos2(r.min.x + 2.5, cy), 2.5, WHITE);
                 }
                 DecoKind::Box(done) => {
                     let b = Rect::from_min_size(pos2(r.min.x, cy - 8.0), vec2(16.0, 16.0));
                     let hov = ui.rect_contains_pointer(b.expand(3.0));
+                    let t = ctx.animate_bool_with_time(id.with(("box", d.line)), done, 0.12);
+                    let border = if hov { WHITE } else { widgets::lerp_color(MUTED, WHITE, t) };
+                    painter.rect_filled(b, 4, WHITE.gamma_multiply(t));
+                    painter.rect_stroke(b, 4, Stroke::new(2.0, border), StrokeKind::Inside);
                     if done {
-                        painter.rect_filled(b, 4, WHITE);
-                        painter.add(Shape::line(
-                            vec![pos2(b.min.x + 3.5, b.center().y), pos2(b.min.x + 6.5, b.max.y - 4.0), pos2(b.max.x - 3.5, b.min.y + 4.5)],
-                            Stroke::new(2.4, BLACK),
-                        ));
-                    } else {
-                        painter.rect_stroke(b, 4, Stroke::new(2.0, if hov { WHITE } else { MUTED }), StrokeKind::Inside);
+                        icons::paint(painter, b.shrink(2.0), Icon::Check, BLACK);
                     }
                     if hov {
                         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -932,7 +1184,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 }
                 DecoKind::Bar => {
                     let r1 = row_rect(d.end);
-                    painter.rect_filled(Rect::from_min_max(pos2(r.min.x, r.min.y + 4.0), pos2(r.min.x + 3.0, r1.max.y - 4.0)), 2, WHITE);
+                    painter.rect_filled(Rect::from_min_max(pos2(r.min.x, r.min.y + 2.0), pos2(r.min.x + 3.0, r1.max.y - 2.0)), 2, WHITE);
                 }
                 DecoKind::Rule => {
                     painter.line_segment([pos2(gp.x, cy), pos2(gp.x + w, cy)], Stroke::new(2.0, BORDER));
@@ -940,6 +1192,57 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 DecoKind::Code { .. } => {}
             }
         }
+
+        // Fold chevrons beside foldable headings.
+        let (hidden_now, heads) = fold_info(&lines, &folds);
+        for (li, closed) in heads {
+            let r = row_rect(starts[li]);
+            let cr = Rect::from_center_size(pos2(gp.x - 34.0 + 14.0, r.min.y + LH / 2.0), vec2(28.0, 28.0));
+            let resp = ui.interact(cr, id.with(("chev", li)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let h = ctx.animate_bool_with_time(id.with(("chevh", li)), resp.hovered(), 0.12);
+            if h > 0.0 {
+                painter.circle_filled(cr.center(), 14.0, PILL.gamma_multiply(h));
+            }
+            let open = ctx.animate_bool_with_time_and_easing(id.with(("chevr", lines[li].trim())), !closed, 0.25, egui::emath::easing::back_out);
+            let col = if closed || resp.hovered() { WHITE } else { MUTED };
+            icons::paint_rot(painter, Rect::from_center_size(cr.center(), vec2(14.0, 14.0)), Icon::Chevron, col, open * std::f32::consts::FRAC_PI_2);
+            if resp.clicked() {
+                fold_toggle = Some(lines[li].trim().to_string());
+            }
+        }
+
+        // The cursor never rests inside a folded section.
+        if hidden_now.contains(&cur_line) {
+            let mut h = cur_line;
+            while h > 0 && hidden_now.contains(&h) {
+                h -= 1;
+            }
+            let end = section_end(&lines, h);
+            let target = if post_cursor > e.snap.sel.1 && end < lines.len() { starts[end] } else { starts[h] + lines[h].chars().count() };
+            set_cursor(&ctx, id, target, target);
+            post_cursor = target;
+            ctx.request_repaint();
+        }
+
+        if let Some(p) = &e.palette {
+            pal_anchor = Some(match p.mode {
+                PalMode::Slash(sl) => row_rect(sl),
+                PalMode::Input { at, .. } => row_rect(at.1.min(acc.saturating_sub(1))),
+            });
+        }
+
+        // Keep the line being edited clear of the toolbar.
+        if let Some(cr) = cursor_screen {
+            if (changed || e.scrolled_for != Some(post_cursor)) && (focused || new_sel.is_some()) {
+                let clip = ui.clip_rect();
+                if cr.max.y > clip.max.y - 90.0 {
+                    ui.scroll_with_delta(vec2(0.0, -(cr.max.y - clip.max.y + 120.0)));
+                } else if cr.min.y < clip.min.y + 10.0 {
+                    ui.scroll_with_delta(vec2(0.0, clip.min.y - cr.min.y + 40.0));
+                }
+            }
+        }
+        e.scrolled_for = Some(post_cursor);
 
         // Clicking below the text puts the cursor at the end.
         let tail = ui.allocate_response(vec2(avail, 240.0), Sense::click());
@@ -953,9 +1256,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
     });
     e.boxes = boxes;
-    if title_enter {
-        e.focus_body = true;
-    }
 
     // Tick a checkbox and put the cursor back where it was.
     if let Some(line) = tick {
@@ -967,6 +1267,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 l.replace_range(at..at + 1, if done { " " } else { "x" });
                 e.text = lines.join("\n");
                 changed = true;
+                force_hist = true;
                 if let Some((a, b)) = sel.or(e.last_sel) {
                     set_cursor(&ctx, id, a, b);
                 }
@@ -975,8 +1276,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     }
 
     // Open the slash menu after typing `/` at a line start or after a space.
-    let post_state = egui::text_edit::TextEditState::load(&ctx, id);
-    let post_cursor = post_state.as_ref().and_then(|s| s.cursor.char_range()).map(|r| r.primary.index.0).unwrap_or(cursor);
     if changed && e.palette.is_none() && new_sel.is_none() && post_cursor > 0 {
         let b = byte_at(&e.text, post_cursor);
         let (ls, _) = line_bounds(&e.text, b);
@@ -989,30 +1288,39 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             let ticks = e.text[ls..sb].matches('`').count();
             let tail = &e.text[sb + 1..b];
             if matches!(prev, None | Some(' ') | Some('\n') | Some('\t')) && fences % 2 == 0 && ticks % 2 == 0 && !tail.contains(' ') {
-                e.palette = Some(Palette { slash: char_at(&e.text, sb), sel: 0, inserted: false });
+                e.palette = Some(Palette::new(PalMode::Slash(char_at(&e.text, sb)), now));
             }
         }
     }
-    // Close it when the cursor leaves the query, or the query stops matching.
+    // Close it when the cursor leaves the query, or the query reads as plain text.
     if let Some(p) = &mut e.palette {
-        let q: Option<String> = if post_cursor > p.slash && e.text.chars().nth(p.slash) == Some('/') {
-            let q: String = e.text.chars().skip(p.slash + 1).take(post_cursor - p.slash - 1).collect();
-            if q.contains('\n') || q.starts_with('/') || q.starts_with(' ') {
-                None
-            } else {
-                Some(q)
+        match &mut p.mode {
+            PalMode::Slash(slash) => {
+                let slash = *slash;
+                let q: Option<String> = if post_cursor > slash && e.text.chars().nth(slash) == Some('/') {
+                    let q: String = e.text.chars().skip(slash + 1).take(post_cursor - slash - 1).collect();
+                    if q.contains('\n') || q.contains('/') || q.starts_with(' ') || q.chars().count() > 24 || matches(&q).is_empty() {
+                        None
+                    } else {
+                        Some(q)
+                    }
+                } else {
+                    None
+                };
+                match q {
+                    None => e.palette = None,
+                    Some(q) => {
+                        if q != p.lastq {
+                            p.sel = 0;
+                            p.lastq = q;
+                        }
+                    }
+                }
             }
-        } else {
-            None
-        };
-        match q {
-            None => e.palette = None,
-            Some(q) => {
-                let list = matches(&q);
-                if list.is_empty() {
+            PalMode::Input { .. } => {
+                // Clicking back into the text closes it.
+                if focused && now - p.opened > 0.2 && new_sel.is_none() {
                     e.palette = None;
-                } else if changed {
-                    p.sel = 0;
                 }
             }
         }
@@ -1020,98 +1328,198 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 
     // Floating toolbar.
     let (blk, isb, isi, iss) = styles_at(&e.text, post_cursor);
-    let tools: Vec<(Result<Icon, &str>, Cmd, bool, String)> = vec![
-        (Err("H"), Cmd::HeadingCycle, matches!(blk, Block::Heading(_)), "Heading".into()),
-        (Err("B"), Cmd::Bold, isb, format!("Bold  {MOD} B")),
-        (Err("I"), Cmd::Italic, isi, format!("Italic  {MOD} I")),
-        (Err("S"), Cmd::Strike, iss, "Strikethrough".into()),
-        (Ok(Icon::Bullets), Cmd::Bullet, blk == Block::Bullet, format!("Bullet list  {MOD} ⇧ 8")),
-        (Ok(Icon::Numbers), Cmd::Number, blk == Block::Number, format!("Numbered list  {MOD} ⇧ 7")),
-        (Ok(Icon::Checkbox), Cmd::Task, matches!(blk, Block::Task(_)), format!("Checkbox  {MOD} ⇧ 9")),
-        (Ok(Icon::Quote), Cmd::Quote, blk == Block::Quote, "Quote".into()),
-        (Ok(Icon::Code), Cmd::Code, false, "Inline code".into()),
-        (Ok(Icon::Link), Cmd::Link, false, format!("Link  {MOD} K")),
+    let tools = vec![
+        Tool::Btn(Err("H"), Cmd::HeadingCycle, matches!(blk, Block::Heading(_)), "Heading", format!("{MOD} ⌥ 1-3")),
+        Tool::Btn(Err("B"), Cmd::Bold, isb, "Bold", format!("{MOD} B")),
+        Tool::Btn(Err("I"), Cmd::Italic, isi && !isb, "Italic", format!("{MOD} I")),
+        Tool::Btn(Err("S"), Cmd::Strike, iss, "Strikethrough", format!("{MOD} ⇧ X")),
+        Tool::Btn(Ok(Icon::Code), Cmd::Code, false, "Code", format!("{MOD} `")),
+        Tool::Btn(Ok(Icon::Link), Cmd::Link, false, "Link", format!("{MOD} K")),
+        Tool::Sep,
+        Tool::Btn(Ok(Icon::Bullets), Cmd::Bullet, blk == Block::Bullet, "Bullet list", format!("{MOD} ⇧ 8")),
+        Tool::Btn(Ok(Icon::Numbers), Cmd::Number, blk == Block::Number, "Numbered list", format!("{MOD} ⇧ 7")),
+        Tool::Btn(Ok(Icon::Checkbox), Cmd::Task, matches!(blk, Block::Task(_)), "Checkbox", format!("{MOD} ⇧ 9")),
+        Tool::Btn(Ok(Icon::Quote), Cmd::Quote, blk == Block::Quote, "Quote", format!("{MOD} ⇧ .")),
+        Tool::Btn(Ok(Icon::Rule), Cmd::Divider, false, "Divider", "---".into()),
+        Tool::Sep,
+        Tool::Btn(Ok(Icon::Indent), Cmd::Indent, false, "Indent", "Tab".into()),
+        Tool::Btn(Ok(Icon::Outdent), Cmd::Outdent, false, "Outdent", "⇧ Tab".into()),
+        Tool::Sep,
+        Tool::Slash,
     ];
-    let slash_w = 96.0;
-    let total = tools.len() as f32 * 42.0 + 3.0 * 12.0 + slash_w + 12.0;
-    let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 18.0 - 26.0), vec2(total.min(rect.width() - 32.0), 52.0));
-    let fg = ui.painter().clone().with_layer_id(egui::LayerId::new(egui::Order::Foreground, Id::new("toolbar"))).with_clip_rect(bar);
+    let slash_glyph = ctx.fonts_mut(|f| f.layout_no_wrap("/".into(), bold(16.0), WHITE).size().x);
+    let insert_w = ctx.fonts_mut(|f| f.layout_no_wrap("Insert".into(), semibold(12.0), MUTED).size().x);
+    let full_slash = 12.0 + slash_glyph + 6.0 + insert_w + 12.0;
+    let nbtn = tools.iter().filter(|t| matches!(t, Tool::Btn(..))).count() as f32;
+    let nsep = tools.iter().filter(|t| matches!(t, Tool::Sep)).count() as f32;
+    let full = 12.0 + nbtn * 42.0 + nsep * 12.0 + full_slash;
+    let avail = rect.width() - 32.0;
+    // Narrow windows: drop the "Insert" label first, then shrink the buttons.
+    let compact = full > avail;
+    let slash_w = if compact { 40.0 } else { full_slash };
+    let bw = if compact { ((avail - 12.0 - nsep * 12.0 - slash_w) / nbtn).clamp(30.0, 42.0) } else { 42.0 };
+    let total = 12.0 + nbtn * bw + nsep * 12.0 + slash_w;
+    let bar_w = total.min(avail.max(120.0));
+    let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 18.0 - 26.0), vec2(bar_w, 52.0));
+    let layer = egui::LayerId::new(egui::Order::Middle, Id::new("toolbar"));
+    let mut tb = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(bar));
+    tb.set_clip_rect(bar);
+    let off = 0.0;
+    let fg = tb.painter().clone();
     fg.rect_filled(bar, 26, TOOLBAR);
-    let mut x = bar.min.x + 6.0;
-    for (i, (icon, cmd, on, tip)) in tools.into_iter().enumerate() {
-        if i == 1 || i == 4 || i == 8 {
-            fg.rect_filled(Rect::from_center_size(pos2(x + 6.0, bar.center().y), vec2(2.0, 22.0)), 1, GUIDE);
-            x += 12.0;
-        }
-        let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(42.0, 42.0));
-        let resp = ui.interact(r.intersect(bar), Id::new(("tool", i)), Sense::click()).on_hover_text(tip);
-        if on {
-            fg.circle_filled(r.center(), 21.0, WHITE);
-        } else if resp.hovered() {
-            fg.circle_filled(r.center(), 21.0, TOOLBAR_HOVER);
-        }
-        let col = if on { BLACK } else { WHITE };
-        match icon {
-            Ok(ic) => icons::paint(&fg, Rect::from_center_size(r.center(), vec2(21.0, 21.0)), ic, col),
-            Err(t) => {
-                let font = match t {
-                    "I" => italic(17.0),
-                    _ => xbold(17.0),
-                };
-                fg.text(r.center(), Align2::CENTER_CENTER, t, font, col);
-                if t == "S" {
-                    fg.line_segment([r.center() - vec2(7.0, 0.0), r.center() + vec2(7.0, 0.0)], Stroke::new(2.0, col));
+    let mut x = bar.min.x + 6.0 - off;
+    for (i, t) in tools.into_iter().enumerate() {
+        match t {
+            Tool::Sep => {
+                fg.rect_filled(Rect::from_min_size(pos2(x + 5.0, bar.center().y - 11.0), vec2(2.0, 22.0)), 1, GUIDE);
+                x += 12.0;
+            }
+            Tool::Btn(icon, cmd, on, tip, key) => {
+                let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0 + (42.0 - bw) / 2.0), vec2(bw, bw));
+                x += bw;
+                let hit = r.intersect(bar);
+                if hit.width() <= 0.0 {
+                    continue;
+                }
+                let tid = Id::new(("tool", i));
+                let resp = tb.interact(hit, tid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                widgets::tip(&tb, &resp, tip, &key, true);
+                let h = ctx.animate_bool_with_time(tid.with("h"), resp.hovered(), 0.12);
+                let pr = ctx.animate_bool_with_time(tid.with("p"), resp.is_pointer_button_down_on(), 0.1);
+                let onv = ctx.animate_bool_with_time(tid.with("on"), on, 0.12);
+                let scale = 1.0 - 0.08 * pr;
+                if h > 0.0 {
+                    fg.circle_filled(r.center(), bw / 2.0 * scale, TOOLBAR_HOVER.gamma_multiply(h));
+                }
+                if onv > 0.0 {
+                    fg.circle_filled(r.center(), bw / 2.0 * scale, WHITE.gamma_multiply(onv));
+                }
+                let col = widgets::lerp_color(WHITE, BLACK, onv);
+                match icon {
+                    Ok(ic) => icons::paint(&fg, Rect::from_center_size(r.center(), vec2(21.0, 21.0) * scale), ic, col),
+                    Err(t) => {
+                        let font = if t == "I" { italic(17.0 * scale) } else { xbold(17.0 * scale) };
+                        fg.text(r.center(), Align2::CENTER_CENTER, t, font, col);
+                        if t == "S" {
+                            fg.line_segment([r.center() - vec2(6.5, -0.5) * scale, r.center() + vec2(6.5, 0.5) * scale], Stroke::new(1.8, col));
+                        }
+                    }
+                }
+                if resp.clicked() {
+                    toolbar_cmd = Some(cmd);
+                }
+            }
+            Tool::Slash => {
+                let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(slash_w, 42.0));
+                x += slash_w;
+                let hit = r.intersect(bar);
+                if hit.width() <= 0.0 {
+                    continue;
+                }
+                let resp = tb.interact(hit, Id::new("tool-slash"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                widgets::tip(&tb, &resp, "All formatting", &format!("{MOD} /"), true);
+                let h = ctx.animate_bool_with_time(Id::new("tool-slash-h"), resp.hovered(), 0.12);
+                let pr = ctx.animate_bool_with_time(Id::new("tool-slash-p"), resp.is_pointer_button_down_on(), 0.1);
+                let rr = Rect::from_center_size(r.center(), r.size() * (1.0 - 0.08 * pr));
+                if h > 0.0 {
+                    fg.rect_filled(rr, 21, TOOLBAR_HOVER.gamma_multiply(h));
+                }
+                if compact {
+                    fg.text(r.center(), Align2::CENTER_CENTER, "/", bold(16.0), WHITE);
+                } else {
+                    fg.text(pos2(r.min.x + 12.0, r.center().y), Align2::LEFT_CENTER, "/", bold(16.0), WHITE);
+                }
+                if !compact {
+                    fg.text(pos2(r.min.x + 12.0 + slash_glyph + 6.0, r.center().y), Align2::LEFT_CENTER, "Insert", semibold(12.0), MUTED);
+                } else {
+                    let _ = slash_glyph;
+                }
+                if resp.clicked() {
+                    open_input = true;
                 }
             }
         }
-        if resp.clicked() {
-            toolbar_cmd = Some(cmd);
-        }
-        x += 42.0;
-    }
-    fg.rect_filled(Rect::from_center_size(pos2(x + 6.0, bar.center().y), vec2(2.0, 22.0)), 1, GUIDE);
-    x += 12.0;
-    let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(slash_w, 42.0));
-    let resp = ui.interact(r.intersect(bar), Id::new("tool-slash"), Sense::click()).on_hover_text(format!("Formatting menu  {MOD} /"));
-    if resp.hovered() {
-        fg.rect_filled(r, 21, TOOLBAR_HOVER);
-    }
-    fg.text(pos2(r.min.x + 14.0, r.center().y), Align2::LEFT_CENTER, "/", mono(16.0), WHITE);
-    fg.text(pos2(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, "Insert", semibold(12.0), MUTED);
-    if resp.clicked() {
-        open_palette_from_toolbar = true;
     }
 
-    // Slash palette.
-    if let (Some(p), Some(cr)) = (&e.palette, cursor_screen) {
-        let q: String = e.text.chars().skip(p.slash + 1).take(post_cursor.saturating_sub(p.slash + 1)).collect();
+    // Formatting palette.
+    if let (Some(p), Some(anchor)) = (&mut e.palette, pal_anchor) {
+        let input = p.is_input();
+        let q: String = match &p.mode {
+            PalMode::Slash(sl) => e.text.chars().skip(sl + 1).take(post_cursor.saturating_sub(sl + 1)).collect(),
+            PalMode::Input { query, .. } => query.clone(),
+        };
         let list = matches(&q);
-        let sel = p.sel.min(list.len().saturating_sub(1));
+        if p.sel >= list.len() {
+            p.sel = list.len().saturating_sub(1);
+        }
+        let t = widgets::progress(&ctx, p.opened, 0.14);
+        let ease = widgets::ease_pop(t);
         let screen = ctx.content_rect();
         let wpal = 320.0;
-        let h = 50.0 + (list.len().min(7) as f32) * 46.0 + 46.0;
-        let mut pos = pos2(cr.min.x - 10.0, cr.max.y + 6.0);
-        if pos.y + h > screen.max.y - 10.0 {
-            pos.y = cr.min.y - 6.0 - h;
+        let list_h = if list.is_empty() { 44.0 } else { (list.len() as f32 * 46.0).min(300.0) };
+        let h = if input { 46.0 } else { 0.0 } + 30.0 + list_h + 46.0 + 12.0;
+        let mut pos = pos2(anchor.min.x - 12.0, anchor.max.y + 8.0);
+        let above = pos.y + h > screen.max.y - 10.0;
+        if above {
+            pos.y = anchor.min.y - h - 8.0;
         }
-        pos.x = pos.x.clamp(8.0, screen.max.x - wpal - 8.0);
+        pos.x = pos.x.clamp(screen.min.x + 8.0, screen.max.x - wpal - 12.0);
+        pos.y = pos.y.max(8.0) + (1.0 - ease) * if above { 4.0 } else { -4.0 };
+        let mut hover_sel = None;
         egui::Area::new(Id::new("palette")).order(egui::Order::Foreground).fixed_pos(pos).show(&ctx, |ui| {
+            ui.multiply_opacity(t.min(1.0));
             egui::Frame::new().fill(MENU).stroke(Stroke::new(LINE, BORDER)).corner_radius(18).inner_margin(6).show(ui, |ui| {
                 ui.set_width(wpal - 12.0);
+                if let PalMode::Input { query, focus, .. } = &mut p.mode {
+                    let (r, _) = ui.allocate_exact_size(vec2(wpal - 12.0, 40.0), Sense::hover());
+                    ui.painter().text(pos2(r.min.x + 10.0, r.center().y - 1.0), Align2::LEFT_CENTER, "/", mono(14.0), MUTED);
+                    let te = ui.put(
+                        Rect::from_min_max(pos2(r.min.x + 28.0, r.min.y + 9.0), pos2(r.max.x - 10.0, r.max.y - 11.0)),
+                        egui::TextEdit::singleline(query)
+                            .id(Id::new("palq"))
+                            .font(sans(14.0))
+                            .text_color(WHITE)
+                            .hint_text(egui::RichText::new("Type what you want, like todo or line").font(sans(14.0)).color(Color32::from_gray(0x66)))
+                            .frame(egui::Frame::NONE)
+                            .margin(egui::Margin::ZERO)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if *focus {
+                        te.request_focus();
+                        *focus = false;
+                    }
+                    if te.changed() {
+                        p.sel = 0;
+                        p.scroll = true;
+                    }
+                    ui.painter().line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(2.0, DIVIDER));
+                    ui.add_space(6.0);
+                }
                 let (r, _) = ui.allocate_exact_size(vec2(wpal - 12.0, 30.0), Sense::hover());
-                ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, "F O R M A T", bold(10.0), MUTED);
-                ui.painter().text(pos2(r.max.x - 10.0, r.center().y), Align2::RIGHT_CENTER, format!("/{q}"), mono(11.0), TEXT3);
-                egui::ScrollArea::vertical().max_height(7.0 * 46.0).show(ui, |ui| {
+                let mut tj = LayoutJob::default();
+                tj.append("INSERT", 0.0, TextFormat { font_id: bold(11.0), color: MUTED, extra_letter_spacing: 1.0, ..Default::default() });
+                let tg = ui.painter().layout_job(tj);
+                ui.painter().galley(pos2(r.min.x + 10.0, r.center().y - tg.size().y / 2.0), tg, MUTED);
+                if !q.is_empty() {
+                    ui.painter().text(pos2(r.max.x - 10.0, r.center().y), Align2::RIGHT_CENTER, format!("/{q}"), mono(11.0), TEXT3);
+                }
+                if list.is_empty() {
+                    let (r, _) = ui.allocate_exact_size(vec2(wpal - 12.0, 44.0), Sense::hover());
+                    ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, format!("Nothing matches “{q}”."), sans(13.0), MUTED);
+                }
+                egui::ScrollArea::vertical().id_salt("pal-list").max_height(300.0).show(ui, |ui| {
                     for (i, c) in list.iter().enumerate() {
                         let (r, resp) = ui.allocate_exact_size(vec2(wpal - 12.0, 46.0), Sense::click());
-                        let on = i == sel;
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                            hover_sel = Some(i);
+                        }
+                        let on = i == p.sel;
                         if on {
                             ui.painter().rect_filled(r, 12, WHITE);
-                            if resp.rect.max.y > 0.0 {
+                            if p.scroll {
                                 ui.scroll_to_rect(r, None);
                             }
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(r, 12, MENU_HOVER);
                         }
                         let fgc = if on { BLACK } else { WHITE };
                         let ic = Rect::from_min_size(pos2(r.min.x + 10.0, r.center().y - 16.0), vec2(32.0, 32.0));
@@ -1120,6 +1528,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                             Ok(icn) => icons::paint(ui.painter(), Rect::from_center_size(ic.center(), vec2(18.0, 18.0)), icn, fgc),
                             Err(t) => {
                                 ui.painter().text(ic.center(), Align2::CENTER_CENTER, t, if t == "I" { italic(13.0) } else { xbold(13.0) }, fgc);
+                                if t == "S" {
+                                    ui.painter().line_segment([ic.center() - vec2(5.0, -0.5), ic.center() + vec2(5.0, 0.5)], Stroke::new(1.5, fgc));
+                                }
                             }
                         }
                         ui.painter().text(pos2(r.min.x + 54.0, r.center().y - 7.0), Align2::LEFT_CENTER, c.name, semibold(14.0), fgc);
@@ -1130,23 +1541,46 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                         }
                     }
                 });
+                ui.add_space(6.0);
                 let (r, _) = ui.allocate_exact_size(vec2(wpal - 12.0, 34.0), Sense::hover());
-                ui.painter().line_segment([pos2(r.min.x, r.min.y + 4.0), pos2(r.max.x, r.min.y + 4.0)], Stroke::new(2.0, DIVIDER));
-                ui.painter().text(pos2(r.min.x + 10.0, r.center().y + 3.0), Align2::LEFT_CENTER, "↑↓ or Tab to move · Enter to insert · Esc for a plain /", sans(11.0), MUTED);
+                let pnt = ui.painter();
+                pnt.line_segment([pos2(r.min.x, r.min.y + 1.0), pos2(r.max.x, r.min.y + 1.0)], Stroke::new(2.0, DIVIDER));
+                let cy = r.center().y + 3.0;
+                let mut cx = r.min.x + 10.0;
+                cx += chip(pnt, cx, cy, "Tab") + 4.0;
+                cx += chip(pnt, cx, cy, "↑↓") + 5.0;
+                cx += pnt.text(pos2(cx, cy), Align2::LEFT_CENTER, "move", sans(11.0), MUTED).width() + 12.0;
+                cx += chip(pnt, cx, cy, "Enter") + 5.0;
+                cx += pnt.text(pos2(cx, cy), Align2::LEFT_CENTER, "insert", sans(11.0), MUTED).width() + 12.0;
+                cx += chip(pnt, cx, cy, "Esc") + 5.0;
+                pnt.text(pos2(cx, cy), Align2::LEFT_CENTER, if input { "close" } else { "keep a plain /" }, sans(11.0), MUTED);
             });
         });
+        p.scroll = false;
+        if let Some(i) = hover_sel {
+            p.sel = i;
+        }
     }
 
     // Toolbar and palette clicks act on the last selection and give focus back.
     let base = sel.or(e.last_sel).unwrap_or((post_cursor, post_cursor));
     if let Some(c) = pal_click {
         if let Some(p) = e.palette.take() {
-            let (b0, b1) = (byte_at(&e.text, p.slash), byte_at(&e.text, post_cursor.max(p.slash + 1)));
-            e.text.replace_range(b0..b1, "");
-            let (a, b) = apply(&mut e.text, (p.slash, p.slash), c, true);
+            let (a, b) = match p.mode {
+                PalMode::Slash(slash) => {
+                    let (b0, b1) = (byte_at(&e.text, slash), byte_at(&e.text, post_cursor.max(slash + 1)));
+                    e.hist.push(Snap { text: e.text.clone(), sel: (post_cursor, post_cursor) });
+                    e.fut.clear();
+                    e.text.replace_range(b0..b1, "");
+                    e.snap = Snap { text: e.text.clone(), sel: (slash, slash) };
+                    apply(&mut e.text, (slash, slash), c, true)
+                }
+                PalMode::Input { at, .. } => apply(&mut e.text, at, c, true),
+            };
             set_cursor(&ctx, id, a, b);
             ctx.memory_mut(|m| m.request_focus(id));
             changed = true;
+            force_hist = true;
         }
     }
     if let Some(c) = toolbar_cmd {
@@ -1154,18 +1588,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         set_cursor(&ctx, id, a, b);
         ctx.memory_mut(|m| m.request_focus(id));
         changed = true;
+        force_hist = true;
     }
-    if open_palette_from_toolbar && e.palette.is_none() {
-        let at = base.1;
-        let b = byte_at(&e.text, at);
-        let needs_space = b > 0 && !matches!(e.text[..b].chars().last(), Some(' ') | Some('\n'));
-        let ins = if needs_space { " /" } else { "/" };
-        e.text.insert_str(b, ins);
-        let slash = at + ins.chars().count() - 1;
-        e.palette = Some(Palette { slash, sel: 0, inserted: true });
-        set_cursor(&ctx, id, slash + 1, slash + 1);
-        ctx.memory_mut(|m| m.request_focus(id));
-        changed = true;
+    if open_input && e.palette.is_none() {
+        e.palette = Some(Palette::new(PalMode::Input { query: String::new(), at: base, focus: true }, now));
     }
 
     if !deferred.is_empty() {
@@ -1173,14 +1599,39 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ctx.request_repaint();
     }
     if changed {
-        if e.dirty_since.is_none() {
-            e.dirty_since = Some(now);
-        } else {
-            e.dirty_since = Some(now);
-        }
+        e.dirty_since = Some(now);
         ctx.request_repaint();
     }
-    let _ = (&app.actions, Action::Read);
+
+    // Undo history: one step per pause in typing, per word, and per command.
+    let end_sel = egui::text_edit::TextEditState::load(&ctx, id)
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| (r.secondary.index.0, r.primary.index.0))
+        .unwrap_or((post_cursor, post_cursor));
+    if e.text != e.snap.text {
+        let pc = end_sel.1;
+        let ws = pc > 0 && e.text.chars().nth(pc - 1).map(|c| c.is_whitespace()).unwrap_or(false);
+        if force_hist || ws || now - e.last_push >= 0.9 {
+            e.hist.push(e.snap.clone());
+            if e.hist.len() > 200 {
+                e.hist.remove(0);
+            }
+            e.fut.clear();
+            e.last_push = if force_hist || ws { 0.0 } else { now };
+        }
+        e.snap.text = e.text.clone();
+    }
+    e.snap.sel = end_sel;
+    e.had_focus = ctx.memory(|m| m.has_focus(id));
+
+    if let Some(k) = fold_toggle {
+        let f = app.folds.entry(path).or_default();
+        if !f.remove(&k) {
+            f.insert(k);
+        }
+        store::save_folds(&app.folds);
+        ctx.request_repaint();
+    }
 }
 
 #[cfg(test)]
@@ -1205,7 +1656,8 @@ mod tests {
     fn inline() {
         assert_eq!(run("ab", (0, 2), Cmd::Bold), ("**ab**".into(), (2, 4)));
         assert_eq!(run("**ab**", (2, 4), Cmd::Bold), ("ab".into(), (0, 2)));
-        assert_eq!(run("", (0, 0), Cmd::Link), ("[text](url)".into(), (1, 5)));
+        assert_eq!(run("", (0, 0), Cmd::Link), ("[link text](https://)".into(), (1, 10)));
+        assert_eq!(run("1. a\nb", (6, 6), Cmd::Number).0, "1. a\n2. b");
     }
     #[test]
     fn enter() {

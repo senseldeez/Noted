@@ -31,6 +31,15 @@ pub enum Icon {
     Outdent,
     Text,
     Import,
+    Undo,
+    Redo,
+    PinFill,
+    FolderFill,
+    Note,
+    Check,
+    Minimize,
+    Maximize,
+    Restore,
 }
 
 /// Draw `icon` centred in `rect`, designed on a 24-unit grid.
@@ -88,23 +97,47 @@ pub fn paint_rot(p: &Painter, rect: Rect, icon: Icon, color: Color32, angle: f32
             dot(18.5, 12.0, 1.9);
         }
         Icon::Folder => folder(),
+        Icon::FolderFill => {
+            let fill = |x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
+                p.rect_filled(Rect::from_two_pos(at(x0, y0), at(x1, y1)), r * s, color);
+            };
+            fill(3.0, 5.0, 11.0, 10.0, 2.0);
+            fill(3.0, 7.5, 21.0, 19.0, 2.0);
+            folder();
+        }
         Icon::FolderPlus => {
             folder();
             line(&[(12.0, 11.0), (12.0, 16.0)]);
             line(&[(9.5, 13.5), (14.5, 13.5)]);
         }
-        Icon::Pin => {
-            line(&[(9.0, 4.0), (15.0, 4.0)]);
-            line(&[(10.0, 4.0), (10.0, 10.0), (7.0, 14.0), (17.0, 14.0), (14.0, 10.0), (14.0, 4.0)]);
-            line(&[(12.0, 14.0), (12.0, 20.0)]);
+        Icon::Pin | Icon::PinFill => {
+            if icon == Icon::PinFill {
+                let poly = |pts: &[(f32, f32)]| {
+                    p.add(Shape::convex_polygon(pts.iter().map(|&(x, y)| at(x, y)).collect(), color, Stroke::NONE));
+                };
+                poly(&[(9.0, 3.0), (15.0, 3.0), (14.0, 10.0), (10.0, 10.0)]);
+                poly(&[(10.0, 10.0), (14.0, 10.0), (18.0, 14.0), (6.0, 14.0)]);
+            }
+            line(&[(9.0, 3.0), (15.0, 3.0), (14.0, 10.0), (18.0, 14.0), (6.0, 14.0), (10.0, 10.0), (9.0, 3.0)]);
+            line(&[(12.0, 14.0), (12.0, 21.0)]);
         }
         Icon::Edit => {
             line(&[(4.0, 20.0), (4.0, 16.0), (15.0, 5.0), (19.0, 9.0), (8.0, 20.0), (4.0, 20.0)]);
             line(&[(13.0, 7.0), (17.0, 11.0)]);
         }
         Icon::Read => {
-            line(&[(12.0, 7.0), (12.0, 20.0)]);
-            line(&[(12.0, 7.0), (10.0, 5.5), (3.0, 5.0), (3.0, 18.0), (10.0, 18.5), (12.0, 20.0), (14.0, 18.5), (21.0, 18.0), (21.0, 5.0), (14.0, 5.5), (12.0, 7.0)]);
+            // Eye.
+            let mut pts = Vec::new();
+            for i in 0..=24 {
+                let t = i as f32 / 24.0;
+                pts.push((2.0 + 20.0 * t, 12.0 - 7.0 * (std::f32::consts::PI * t).sin()));
+            }
+            for i in 1..=24 {
+                let t = 1.0 - i as f32 / 24.0;
+                pts.push((2.0 + 20.0 * t, 12.0 + 7.0 * (std::f32::consts::PI * t).sin()));
+            }
+            line(&pts);
+            circle(12.0, 12.0, 3.0);
         }
         Icon::Trash => {
             line(&[(4.0, 7.0), (20.0, 7.0)]);
@@ -191,6 +224,28 @@ pub fn paint_rot(p: &Painter, rect: Rect, icon: Icon, color: Color32, angle: f32
         Icon::Text => {
             line(&[(5.0, 6.0), (19.0, 6.0)]);
             line(&[(12.0, 6.0), (12.0, 19.0)]);
+        }
+        Icon::Undo | Icon::Redo => {
+            let m = |x: f32| if icon == Icon::Undo { x } else { 24.0 - x };
+            line(&[(m(9.0), 14.0), (m(4.0), 9.0), (m(9.0), 4.0)]);
+            let mut pts = vec![(m(4.0), 9.0), (m(14.0), 9.0)];
+            for i in 1..=16 {
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 16.0;
+                pts.push((m(14.0 + 6.0 * a.cos()), 15.0 + 6.0 * a.sin()));
+            }
+            pts.push((m(11.0), 21.0));
+            line(&pts);
+        }
+        Icon::Note => {
+            line(&[(7.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (7.0, 21.0), (5.0, 19.0), (5.0, 5.0), (7.0, 3.0)]);
+            line(&[(14.0, 3.0), (14.0, 8.0), (19.0, 8.0)]);
+        }
+        Icon::Check => line(&[(6.0, 12.5), (10.0, 16.5), (18.0, 7.5)]),
+        Icon::Minimize => line(&[(5.0, 12.0), (19.0, 12.0)]),
+        Icon::Maximize => rrect(5.0, 5.0, 19.0, 19.0, 2.0),
+        Icon::Restore => {
+            rrect(5.0, 8.0, 16.0, 19.0, 2.0);
+            line(&[(8.0, 5.0), (19.0, 5.0), (19.0, 16.0)]);
         }
         Icon::Import => {
             line(&[(12.0, 4.0), (12.0, 15.0)]);

@@ -25,6 +25,9 @@ fn main() -> eframe::Result {
         .with_icon(icon());
     if cfg!(target_os = "macos") {
         vp = vp.with_fullsize_content_view(true).with_title_shown(false).with_titlebar_shown(false);
+    } else {
+        // The app draws its own title bar and window buttons, like the Electron version did.
+        vp = vp.with_decorations(false);
     }
     let opts = eframe::NativeOptions { viewport: vp, persist_window: true, ..Default::default() };
     eframe::run_native("Noted", opts, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

@@ -1,5 +1,5 @@
 //! The home/folder grid: Keep-style masonry of note and folder cards, pinned on top.
-use crate::app::{mi, sep, Action, App, Drag};
+use crate::app::{mi, sep, Action, App, Drag, MenuAt};
 use crate::icons::{self, Icon};
 use crate::md::{self, Block};
 use crate::store::Item;
@@ -174,28 +174,21 @@ fn build_card(ui: &Ui, item: &Item, w: f32, all: &Item) -> Card {
     Card { title, rows, meta, height: h }
 }
 
-fn paint_card(ui: &Ui, rect: Rect, item: &Item, card: &Card, hovered: bool, selected: bool, lifted: bool) {
-    let p = ui.painter();
+fn paint_card(p: &egui::Painter, rect: Rect, item: &Item, card: &Card, hover: f32, selected: bool, lifted: bool) {
     let fill = if lifted { SURFACE } else { BLACK };
     p.rect_filled(rect, 22, fill);
-    let (w, col) = if selected || lifted {
-        (2.5, WHITE)
-    } else if hovered {
-        (LINE, BORDER_HOVER)
-    } else {
-        (LINE, BORDER)
-    };
+    let (w, col) = if selected || lifted { (2.5, WHITE) } else { (LINE, widgets::lerp_color(BORDER, BORDER_HOVER, hover)) };
     p.rect_stroke(rect, 22, Stroke::new(w, col), StrokeKind::Inside);
     let x0 = rect.min.x + PAD;
     let mut y = rect.min.y + PAD;
     let mut tx = x0;
     if item.is_folder() {
-        icons::paint(p, Rect::from_min_size(pos2(x0, y + 2.0), vec2(16.0, 16.0)), Icon::Folder, WHITE);
+        icons::paint(p, Rect::from_min_size(pos2(x0, y + 2.0), vec2(16.0, 16.0)), Icon::FolderFill, WHITE);
         tx += 24.0;
     }
     p.galley(pos2(tx, y), card.title.clone(), WHITE);
     if item.pinned {
-        icons::paint(p, Rect::from_min_size(pos2(rect.max.x - PAD - 14.0, y + 3.0), vec2(14.0, 14.0)), Icon::Pin, MUTED);
+        icons::paint(p, Rect::from_min_size(pos2(rect.max.x - PAD - 14.0, y + 3.0), vec2(14.0, 14.0)), Icon::PinFill, WHITE);
     }
     y += card.title.size().y.max(20.0);
     if !card.rows.is_empty() {
@@ -240,16 +233,15 @@ fn paint_card(ui: &Ui, rect: Rect, item: &Item, card: &Card, hovered: bool, sele
 pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
     let Some(folder) = app.tree.find(&dir).cloned() else { return };
     let rect = ui.max_rect();
-    let now = ui.input(|i| i.time);
+    let ctx = ui.ctx().clone();
+    let now = ctx.input(|i| i.time);
 
     if folder.children.is_empty() {
-        ui.painter().text(
-            rect.center() - vec2(0.0, 40.0),
-            Align2::CENTER_CENTER,
-            "Nothing here yet.\nPress + to write your first note,\nor drop .md files onto the window.",
-            sans(13.0),
-            MUTED,
-        );
+        let mut job = widgets::simple_job(&format!("Nothing here yet.\nPress + or {}+N to write a note.", widgets::MOD), sans(13.0), MUTED, 400.0, 0);
+        job.sections[0].format.line_height = Some(21.0);
+        job.halign = egui::Align::Center;
+        let g = widgets::layout(ui, job);
+        ui.painter().galley(rect.center() - vec2(0.0, g.size().y / 2.0 + 20.0), g, MUTED);
     }
 
     // Groups, with the dragged card's group in its live order.
@@ -276,6 +268,7 @@ pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
     let mut dragged_card: Option<(Item, Card, Rect)> = None;
     let selected = app.selected.clone();
     let tree = app.tree.clone();
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
 
     egui::ScrollArea::vertical().id_salt(("grid", &dir)).auto_shrink([false, false]).show(ui, |ui| {
         let width = ui.available_width() - MARGIN * 2.0;
@@ -283,12 +276,13 @@ pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
         let cw = (width - GAP * (cols as f32 - 1.0)) / cols as f32;
         let origin = ui.min_rect().min + vec2(MARGIN, 4.0);
         let mut y0 = 0.0;
-        let mut place = |ui: &mut Ui, list: &[&Item], y0: f32, out: &mut Vec<(Item, Card, Rect)>| -> f32 {
+        // Card slots relative to the grid origin.
+        let place = |ui: &mut Ui, list: &[&Item], y0: f32, out: &mut Vec<(Item, Card, Rect)>| -> f32 {
             let mut h = vec![y0; cols];
             for item in list {
                 let card = build_card(ui, item, cw, &tree);
                 let c = (0..cols).min_by(|&a, &b| h[a].partial_cmp(&h[b]).unwrap()).unwrap();
-                let r = Rect::from_min_size(origin + vec2(c as f32 * (cw + GAP), h[c]), vec2(cw, card.height));
+                let r = Rect::from_min_size(egui::Pos2::ZERO + vec2(c as f32 * (cw + GAP), h[c]), vec2(cw, card.height));
                 h[c] += card.height + GAP;
                 out.push(((*item).clone(), card, r));
             }
@@ -296,31 +290,38 @@ pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
         };
         let mut placed = Vec::new();
         if !pinned.is_empty() {
-            ui.painter().text(origin + vec2(6.0, 0.0), Align2::LEFT_TOP, "P I N N E D", bold(11.0), MUTED);
+            let mut lj = LayoutJob::default();
+            lj.append("PINNED", 0.0, TextFormat { font_id: bold(11.0), color: MUTED, extra_letter_spacing: 1.0, ..Default::default() });
+            let lg = widgets::layout(ui, lj);
+            ui.painter().galley(origin + vec2(6.0, 0.0), lg, MUTED);
             y0 = place(ui, &pinned, 24.0, &mut placed);
-            ui.painter().line_segment(
-                [origin + vec2(4.0, y0 + 4.0), origin + vec2(width - 4.0, y0 + 4.0)],
-                Stroke::new(2.0, DIVIDER),
-            );
+            ui.painter().line_segment([origin + vec2(4.0, y0 + 4.0), origin + vec2(width - 4.0, y0 + 4.0)], Stroke::new(2.0, DIVIDER));
             y0 += 18.0;
         }
         let end = place(ui, &rest, y0, &mut placed);
         ui.allocate_rect(Rect::from_min_size(ui.min_rect().min, vec2(ui.available_width(), end + 4.0 + 160.0)), Sense::hover());
 
-        for (item, card, r) in placed {
+        // Cards glide to their slots when the order or the column count changes.
+        let mut dragged_slot = None;
+        for (item, card, slot) in placed {
             let id = ui.id().with(("card", &item.path));
+            let rel = widgets::anim_vec2(&ctx, id.with("pos"), slot.min.to_vec2(), 0.28);
+            let r = Rect::from_min_size(origin + rel, slot.size());
             let resp = ui.interact(r, id, Sense::click_and_drag());
-            new_rects.push((item.path.clone(), r));
+            new_rects.push((item.path.clone(), Rect::from_min_size(origin + slot.min.to_vec2(), slot.size())));
             let is_dragged = app.drag.as_ref().map(|d| d.path == item.path).unwrap_or(false);
             if is_dragged {
-                ui.painter().rect_stroke(r, 22, Stroke::new(2.0, Color32::from_gray(0x6a)), StrokeKind::Inside);
+                dragged_slot = Some(r);
                 dragged_card = Some((item.clone(), card, r));
             } else {
-                paint_card(ui, r, &item, &card, resp.hovered(), selected.contains(&item.path), false);
+                let hover = ctx.animate_bool_with_time(id.with("h"), resp.hovered() && app.drag.is_none(), 0.12);
+                let press = ctx.animate_bool_with_time(id.with("press"), resp.is_pointer_button_down_on() && app.drag.is_none(), 0.1);
+                let pr = Rect::from_center_size(r.center(), r.size() * (1.0 - 0.03 * press));
+                paint_card(ui.painter(), pr, &item, &card, hover, selected.contains(&item.path), false);
             }
             let mods = ui.input(|i| i.modifiers);
             if resp.clicked() {
-                if mods.command || mods.shift || !app.selected.is_empty() {
+                if mods.command || !app.selected.is_empty() {
                     if !app.selected.remove(&item.path) {
                         app.selected.insert(item.path.clone());
                     }
@@ -330,67 +331,68 @@ pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
                     app.actions.push(Action::OpenNote(item.path.clone()));
                 }
             }
-            if resp.double_clicked() && !item.is_folder() && app.selected.is_empty() {
-                app.actions.push(Action::EditNote(item.path.clone()));
-            }
             if resp.secondary_clicked() {
-                let targets: Vec<PathBuf> = if app.selected.contains(&item.path) {
-                    app.selected.iter().cloned().collect()
-                } else {
-                    vec![item.path.clone()]
-                };
+                let targets: Vec<PathBuf> = if app.selected.contains(&item.path) { app.selected.iter().cloned().collect() } else { vec![item.path.clone()] };
                 let pos = ui.input(|i| i.pointer.interact_pos()).unwrap_or(r.center());
                 let n = targets.len();
+                let all_pinned = targets.iter().all(|t| tree.find(t).map(|i| i.pinned).unwrap_or(false));
                 let mut items = Vec::new();
                 if n == 1 {
-                    items.push(mi(Icon::Chevron, "Open", "", if item.is_folder() { Action::OpenFolder(item.path.clone()) } else { Action::OpenNote(item.path.clone()) }));
-                    if !item.is_folder() {
-                        items.push(mi(Icon::Edit, "Edit", "", Action::EditNote(item.path.clone())));
-                    }
-                    items.push(sep());
+                    items.push(mi(Icon::Note, "Open", "Enter", if item.is_folder() { Action::OpenFolder(item.path.clone()) } else { Action::OpenNote(item.path.clone()) }));
                 }
-                let all_pinned = targets.iter().all(|t| tree.find(t).map(|i| i.pinned).unwrap_or(false));
-                items.push(mi(Icon::Pin, if all_pinned { "Unpin" } else { "Pin" }, "", Action::Pin(targets.clone(), !all_pinned)));
+                items.push(mi(if all_pinned { Icon::Pin } else { Icon::PinFill }, if all_pinned { "Unpin" } else { "Pin" }, "", Action::Pin(targets.clone(), !all_pinned)));
                 if n == 1 {
                     items.push(mi(Icon::Rename, "Rename", "F2", Action::Rename(item.path.clone())));
                 }
                 items.push(mi(Icon::Move, "Move to…", "", Action::Move(targets.clone())));
-                if n == 1 {
-                    items.push(mi(Icon::Reveal, "Show in file manager", "", Action::Reveal(item.path.clone())));
-                }
                 items.push(sep());
-                items.push(mi(Icon::Trash, if n == 1 { "Delete".into() } else { format!("Delete {n} items") }.as_str(), "Del", Action::Trash(targets)));
-                app.open_menu(ui, pos, items);
+                let label = if n == 1 { "Delete".to_string() } else { format!("Delete {n} items") };
+                items.push(mi(Icon::Trash, &label, "Del", Action::Delete(targets, false)));
+                app.open_menu(ui, MenuAt::Point(pos), items);
             }
             if resp.drag_started() && app.selected.is_empty() {
                 let grab = ui.input(|i| i.pointer.press_origin()).map(|p| p - r.min).unwrap_or_default();
                 let group = if item.pinned { &pinned } else { &rest };
-                app.drag = Some(Drag { path: item.path.clone(), grab, pinned: item.pinned, order: group.iter().map(|c| c.path.clone()).collect() });
+                app.drag = Some(Drag { path: item.path.clone(), grab, pinned: item.pinned, order: group.iter().map(|c| c.path.clone()).collect(), started: now });
+            }
+        }
+        // Dashed outline where the dragged card will land.
+        if let Some(r) = dragged_slot {
+            ui.painter().extend(egui::Shape::dashed_line(&widgets::rounded_path(r.shrink(1.0), 21.0), Stroke::new(2.0, Color32::from_gray(0x6a)), 7.0, 5.0));
+        }
+        // Scroll when dragging near the top or bottom edge.
+        if app.drag.is_some() {
+            if let Some(p) = pointer {
+                if p.y < rect.min.y + 60.0 {
+                    ui.scroll_with_delta(vec2(0.0, 12.0));
+                    ctx.request_repaint();
+                } else if p.y > rect.max.y - 60.0 {
+                    ui.scroll_with_delta(vec2(0.0, -12.0));
+                    ctx.request_repaint();
+                }
             }
         }
     });
 
-    // Dragging: move the card under the pointer and reorder its group live.
+    // Dragging: the card follows the pointer, lifted, and its group reorders live.
     if let Some(d) = &mut app.drag {
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-        let released = ui.input(|i| !i.pointer.primary_down());
-        if let (Some(ptr), Some((item, card, _))) = (pointer, &dragged_card) {
+        let released = ctx.input(|i| !i.pointer.primary_down());
+        if let (Some(ptr), Some((item, card, slot))) = (pointer, &dragged_card) {
             if let Some((target, _)) = new_rects.iter().find(|(p, r)| r.contains(ptr) && p != &d.path && d.order.contains(p)) {
                 let from = d.order.iter().position(|p| p == &d.path).unwrap();
                 let to = d.order.iter().position(|p| p == target).unwrap();
                 let moved = d.order.remove(from);
                 d.order.insert(to, moved);
             }
-            let r = Rect::from_min_size(ptr - d.grab, vec2(card.title.size().x.max(0.0) * 0.0 + new_rects.iter().find(|(p, _)| p == &d.path).map(|x| x.1.width()).unwrap_or(230.0), card.height));
+            let r = Rect::from_min_size(ptr - d.grab, slot.size());
             let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dragcard"));
-            let mut drag_ui = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(r));
-            drag_ui.set_clip_rect(ui.ctx().content_rect());
-            paint_card(&drag_ui, r, item, card, false, false, true);
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            // Scroll near the edges.
-            if ptr.y > rect.max.y - 40.0 || ptr.y < rect.min.y + 40.0 {
-                ui.ctx().request_repaint();
-            }
+            let lift = widgets::ease_pop(widgets::progress(&ctx, d.started, 0.18));
+            let s = 1.0 + 0.05 * lift;
+            let c = r.center().to_vec2();
+            ctx.set_transform_layer(layer, egui::emath::TSTransform::from_translation(c) * egui::emath::TSTransform::from_scaling(s) * egui::emath::TSTransform::from_translation(-c));
+            let painter = ctx.layer_painter(layer);
+            paint_card(&painter, r, item, card, 0.0, false, true);
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         }
         if released {
             let d = app.drag.take().unwrap();
@@ -408,54 +410,57 @@ pub fn show(app: &mut App, ui: &mut Ui, dir: PathBuf) {
     }
     app.card_rects = new_rects;
 
-    // Floating action button, or the selection bar.
+    // Floating add button, or the selection bar.
+    let sel_id = ui.id().with("selbar-at");
     if app.selected.is_empty() {
-        let c = pos2(rect.max.x - 26.0 - 30.0, rect.max.y - 26.0 - 30.0);
-        let fr = Rect::from_center_size(c, vec2(60.0, 60.0));
-        let resp = ui.interact(fr, ui.id().with("fab"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("New note   {} N", widgets::MOD));
-        let scale = if resp.is_pointer_button_down_on() { 0.94 } else if resp.hovered() { 1.06 } else { 1.0 };
-        let fg = ui.painter().clone().with_layer_id(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("fab")));
-        fg.circle_filled(c, 30.0 * scale, WHITE);
-        icons::paint(&fg, Rect::from_center_size(c, vec2(26.0, 26.0)), Icon::Plus, BLACK);
-        if resp.clicked() {
-            app.actions.push(Action::NewNote(dir.clone()));
+        ctx.data_mut(|d| d.remove::<f64>(sel_id));
+        let fab = crate::reader::fab(ui, rect, Icon::Plus, "New note or folder", &format!("{} N", widgets::MOD));
+        if fab.clicked() {
+            let items = vec![
+                mi(Icon::Note, "New note", &format!("{} N", widgets::MOD), Action::NewNote(dir.clone())),
+                mi(Icon::Folder, "New folder", &format!("{} ⇧ N", widgets::MOD), Action::NewFolder(dir.clone())),
+                mi(Icon::Import, "Import .md files", "", Action::Import(dir.clone())),
+            ];
+            app.open_menu(ui, MenuAt::Above(fab.rect), items);
         }
     } else {
+        let shown_at = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(sel_id, || now));
+        let t = widgets::progress(&ctx, shown_at, 0.26);
+        let e = widgets::ease_pop(t);
         let sel: Vec<PathBuf> = app.selected.iter().cloned().collect();
         let n = sel.len();
         let all_pinned = sel.iter().all(|t| app.tree.find(t).map(|i| i.pinned).unwrap_or(false));
-        let label = format!("{n} selected");
-        let buttons: Vec<(Icon, &str, Action)> = vec![
-            (Icon::Pin, if all_pinned { "Unpin" } else { "Pin" }, Action::Pin(sel.clone(), !all_pinned)),
+        let mut buttons: Vec<(Icon, &str, Action)> = vec![
+            (if all_pinned { Icon::Pin } else { Icon::PinFill }, if all_pinned { "Unpin" } else { "Pin" }, Action::Pin(sel.clone(), !all_pinned)),
             (Icon::Move, "Move", Action::Move(sel.clone())),
-            (Icon::Trash, "Delete", Action::Trash(sel.clone())),
-            (Icon::Close, "", Action::ClearSelection),
         ];
-        let fg = ui.painter().clone().with_layer_id(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("selbar")));
-        let widths: Vec<f32> = buttons.iter().map(|b| if b.1.is_empty() { 46.0 } else { widgets::pill_width(ui, b.1, true) - 4.0 }).collect();
-        let lw = widgets::pill_width(ui, &label, false);
-        let total = lw + widths.iter().sum::<f32>() + 10.0;
-        let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 24.0 - 28.0), vec2(total, 56.0));
+        if n == 1 {
+            buttons.push((Icon::Rename, "Rename", Action::Rename(sel[0].clone())));
+        }
+        buttons.push((Icon::Trash, "Delete", Action::Delete(sel.clone(), false)));
+        let widths: Vec<f32> = buttons.iter().map(|b| 16.0 + 18.0 + 8.0 + ui.fonts_mut(|f| f.layout_no_wrap(b.1.into(), bold(13.0), WHITE).size().x) + 16.0).collect();
+        let total = widths.iter().sum::<f32>() + 2.0 * (widths.len() as f32 - 1.0) + 10.0;
+        let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 24.0 - 28.0 + (1.0 - e) * 30.0), vec2(total, 56.0));
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("selbar"));
+        let mut sui = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(bar));
+        sui.multiply_opacity(t);
+        let fg = sui.painter().clone();
         fg.rect_filled(bar, 28, TOOLBAR);
-        fg.text(pos2(bar.min.x + 5.0 + lw / 2.0, bar.center().y), Align2::CENTER_CENTER, &label, bold(13.0), MUTED);
-        let mut x = bar.min.x + 5.0 + lw;
+        let mut x = bar.min.x + 5.0;
         for ((icon, text, act), w) in buttons.into_iter().zip(widths) {
             let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(w, 46.0));
-            let resp = ui.interact(r, ui.id().with(("selbtn", text, icon as u8)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            if resp.hovered() {
-                fg.rect_filled(r, 23, TOOLBAR_HOVER);
+            let bid = egui::Id::new(("selbtn", text));
+            let resp = sui.interact(r, bid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let h = ctx.animate_bool_with_time(bid.with("h"), resp.hovered(), 0.12);
+            if h > 0.0 {
+                fg.rect_filled(r, 23, TOOLBAR_HOVER.gamma_multiply(h));
             }
-            if text.is_empty() {
-                icons::paint(&fg, Rect::from_center_size(r.center(), vec2(18.0, 18.0)), icon, WHITE);
-            } else {
-                icons::paint(&fg, Rect::from_min_size(pos2(r.min.x + 16.0, r.center().y - 9.0), vec2(18.0, 18.0)), icon, WHITE);
-                fg.text(pos2(r.min.x + 42.0, r.center().y), Align2::LEFT_CENTER, text, bold(13.0), WHITE);
-            }
+            icons::paint(&fg, Rect::from_min_size(pos2(r.min.x + 16.0, r.center().y - 9.0), vec2(18.0, 18.0)), icon, WHITE);
+            fg.text(pos2(r.min.x + 42.0, r.center().y), Align2::LEFT_CENTER, text, bold(13.0), WHITE);
             if resp.clicked() {
                 app.actions.push(act);
             }
-            x += w;
+            x += w + 2.0;
         }
     }
-    let _ = now;
 }

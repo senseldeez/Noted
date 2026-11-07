@@ -398,3 +398,48 @@ pub fn ensure_root() -> PathBuf {
     save_root(&root);
     root
 }
+
+/* ---------- folded headings, remembered between launches ---------- */
+
+fn folds_file() -> Option<PathBuf> {
+    directories::ProjectDirs::from("app", "noted", "Noted").map(|d| d.config_dir().join("folds.json"))
+}
+
+pub fn load_folds() -> std::collections::HashMap<PathBuf, std::collections::HashSet<String>> {
+    let raw: std::collections::HashMap<String, Vec<String>> = folds_file()
+        .and_then(|f| fs::read_to_string(f).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    raw.into_iter().map(|(k, v)| (PathBuf::from(k), v.into_iter().collect())).collect()
+}
+
+pub fn save_folds(folds: &std::collections::HashMap<PathBuf, std::collections::HashSet<String>>) {
+    let Some(f) = folds_file() else { return };
+    let raw: std::collections::BTreeMap<String, Vec<String>> = folds
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| {
+            let mut v: Vec<String> = v.iter().cloned().collect();
+            v.sort();
+            (k.to_string_lossy().into_owned(), v)
+        })
+        .collect();
+    let _ = fs::create_dir_all(f.parent().unwrap());
+    let _ = fs::write(f, serde_json::to_string(&raw).unwrap_or_default());
+}
+
+/// "just now", "5 min. ago", "3 hours ago", "yesterday", "4 days ago".
+pub fn ago(mtime: f64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let s = (now - mtime).max(0.0);
+    if s < 60.0 {
+        "just now".into()
+    } else if s < 3600.0 {
+        format!("{} min. ago", (s / 60.0).round())
+    } else if s < 86400.0 {
+        format!("{} hours ago", (s / 3600.0).round())
+    } else {
+        let d = (s / 86400.0).round();
+        if d == 1.0 { "yesterday".into() } else { format!("{d} days ago") }
+    }
+}
