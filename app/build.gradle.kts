@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -20,7 +22,7 @@ android {
     signingConfigs {
         // The release key is never committed. CI decodes it from the ANDROID_KEYSTORE_BASE64
         // secret; locally, put keystore.properties (and the .jks it names) in the repo root.
-        val props = java.util.Properties().apply {
+        val props = Properties().apply {
             rootProject.file("keystore.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
         }
         val storePath = System.getenv("NOTED_KEYSTORE") ?: props.getProperty("storeFile")
