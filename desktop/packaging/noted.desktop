@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Noted
+Comment=A minimal OLED markdown editor
+Exec=noted
+Icon=noted
+Terminal=false
+Categories=Office;TextEditor;Utility;
+MimeType=text/markdown;
+StartupWMClass=noted
