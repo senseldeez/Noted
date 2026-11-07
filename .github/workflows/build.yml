@@ -1,0 +1,132 @@
+name: Build and release
+
+# Every push and PR builds all platforms. A `v*` tag, or running this workflow by hand
+# with "release" ticked, also publishes a GitHub Release with every build attached.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a GitHub Release for the version in desktop/Cargo.toml
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release) }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=$(grep -m1 '^version' desktop/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults: { run: { working-directory: desktop } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop }
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - shell: bash
+        run: mkdir -p dist && cp target/release/noted.exe "dist/Noted-${{ needs.version.outputs.version }}-windows-x64.exe"
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: desktop/dist/* }
+
+  macos:
+    needs: version
+    runs-on: macos-14
+    defaults: { run: { working-directory: desktop } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop }
+      - run: packaging/build-macos.sh ${{ needs.version.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: "desktop/dist/Noted-*" }
+
+  linux:
+    needs: version
+    # The oldest supported runner, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
+    defaults: { run: { working-directory: desktop } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev imagemagick libfuse2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop }
+      - run: cargo install cargo-deb --locked
+      - run: cargo test --locked
+      - run: packaging/build-linux.sh ${{ needs.version.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: "desktop/dist/Noted-*" }
+
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Signing key
+        env:
+          KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "$KEY" | base64 -d > "$RUNNER_TEMP/noted.jks"
+            {
+              echo "NOTED_KEYSTORE=$RUNNER_TEMP/noted.jks"
+              echo "NOTED_KEYSTORE_PASSWORD=$PW"
+              echo "NOTED_KEY_PASSWORD=$PW"
+            } >> "$GITHUB_ENV"
+          elif [ "$PUBLISH" = "true" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is missing; refusing to release a debug-signed APK"
+            exit 1
+          else
+            echo "No signing secret here; building with the debug key."
+          fi
+      - run: ./gradlew assembleRelease --no-daemon
+      - run: mkdir -p dist && cp app/build/outputs/apk/release/app-release.apk "dist/Noted-${{ needs.version.outputs.version }}-android.apk"
+      - uses: actions/upload-artifact@v4
+        with: { name: android, path: dist/* }
+
+  release:
+    needs: [version, windows, macos, linux, android]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Noted ${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
+          files: dist/*
+          fail_on_unmatched_files: true
