@@ -72,8 +72,15 @@ private val Hidden = SpanStyle(color = Color.Transparent, fontSize = 0.01.sp, le
 private val Invisible = SpanStyle(color = Color.Transparent)
 private val Dim = SpanStyle(color = C.Syntax, fontWeight = FontWeight.Normal, fontStyle = FontStyle.Normal, textDecoration = TextDecoration.None)
 
+/** Body text size in the reader and the editor. */
+val BodySize = 16.sp
+val CodeSize = 14.sp
+
 /** Heading sizes are capped so every glyph fits inside the shared 28sp line box. */
-fun headingSize(level: Int) = when (level) { 1 -> 22.sp; 2 -> 19.sp; 3 -> 17.sp; else -> 15.sp }
+fun headingSize(level: Int) = when (level) { 1 -> 22.sp; 2 -> 19.sp; 3 -> 17.sp; else -> BodySize }
+
+/** Extra width given to each leading space or tab, so nested lists and indented lines step in further. */
+private val IndentWide = SpanStyle(letterSpacing = 6.sp)
 
 /** One line box height for every line. Glyphs stay inside their own box, so the active-line pill never touches its neighbours. */
 private val BodyLine = 28.sp
@@ -157,6 +164,12 @@ class LivePreview(private val active: IntRange, private val folded: Set<String>)
                 }
             }
             val info = infos[i]
+            // Widen the leading indentation (not inside code blocks, where alignment matters).
+            if (info.kind != LineKind.CODE && info.kind != LineKind.FENCE && info.kind != LineKind.BLANK) {
+                var w = 0
+                while (w < l.length && (l[w] == ' ' || l[w] == '\t')) w++
+                if (w > 0) base += AnnotatedString.Range(IndentWide, s, s + w)
+            }
             when (info.kind) {
                 LineKind.HEADING -> {
                     style(SpanStyle(fontSize = headingSize(info.level), fontWeight = FontWeight.Bold, color = C.White), s, e)
@@ -187,7 +200,7 @@ class LivePreview(private val active: IntRange, private val folded: Set<String>)
                 }
                 LineKind.RULE -> ghost(s, e)
                 LineKind.FENCE -> style(Dim.copy(fontFamily = Mono), s, e)
-                LineKind.CODE -> style(SpanStyle(color = C.Text2, fontFamily = Mono, fontSize = 13.sp), s, e)
+                LineKind.CODE -> style(SpanStyle(color = C.Text2, fontFamily = Mono, fontSize = CodeSize), s, e)
                 LineKind.TEXT -> {
                     style(SpanStyle(color = C.Text2), s, e)
                     inline(s)
@@ -247,6 +260,7 @@ fun LiveEditor(
     folded: Set<String>,
     onToggleFold: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onLayout: (TextLayoutResult) -> Unit = {},
 ) {
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val active = activeRange(value.text, value.selection)
@@ -272,7 +286,7 @@ fun LiveEditor(
     val transformation = remember(active, effectiveFolded) { LivePreview(active, effectiveFolded) }
     val decos = remember(value.text, active, effectiveFolded) { decorations(value.text, active, effectiveFolded) }
     val textStyle = remember {
-        TextStyle(fontFamily = Sans, fontSize = 15.sp, lineHeight = BodyLine, lineHeightStyle = CenteredLines, color = C.White)
+        TextStyle(fontFamily = Sans, fontSize = BodySize, lineHeight = BodyLine, lineHeightStyle = CenteredLines, color = C.White)
     }
     val density = LocalDensity.current
 
@@ -293,7 +307,7 @@ fun LiveEditor(
                 val o = off.coerceIn(0, len)
                 val rawLine = (lineStarts.indexOfLast { it <= o }).coerceAtLeast(0)
                 val info = infos.getOrNull(rawLine)
-                val size = if (info?.kind == LineKind.HEADING) headingSize(info.level) else 15.sp
+                val size = if (info?.kind == LineKind.HEADING) headingSize(info.level) else BodySize
                 val fontPx = with(density) { size.toPx() }
                 return lay.getLineBaseline(lay.getLineForOffset(o)) - fontPx * 0.355f
             }
@@ -338,7 +352,7 @@ fun LiveEditor(
                     val b = lay2.getBoundingBox(d.open + 2)
                     val side = 16.dp.toPx()
                     val cx = (a.left + b.right) / 2f
-                    val cy = lay2.getLineBaseline(lay2.getLineForOffset(d.open.coerceIn(0, len))) - 15.sp.toPx() * 0.355f
+                    val cy = lay2.getLineBaseline(lay2.getLineForOffset(d.open.coerceIn(0, len))) - BodySize.toPx() * 0.355f
                     val tl = Offset(cx - side / 2, cy - side / 2)
                     if (d.checked) {
                         drawRoundRect(C.White, tl, Size(side, side), CornerRadius(4.dp.toPx()))
@@ -376,7 +390,7 @@ fun LiveEditor(
             onValueChange = onValueChange,
             textStyle = textStyle,
             visualTransformation = transformation,
-            onTextLayout = { layout = it },
+            onTextLayout = { layout = it; onLayout(it) },
             cursorBrush = SolidColor(C.White),
             keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, autoCorrectEnabled = true),
             modifier = Modifier.fillMaxWidth().focusRequester(focus),

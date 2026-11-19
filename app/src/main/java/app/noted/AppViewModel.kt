@@ -23,7 +23,8 @@ import java.io.File
 sealed class Screen {
     data object Setup : Screen()
     data class Folder(val dir: File) : Screen()
-    data class Note(val file: File, val editing: Boolean = false) : Screen()
+    /** [cursor]: where to put the caret when opening the editor (null = end of note). */
+    data class Note(val file: File, val editing: Boolean = false, val cursor: Int? = null) : Screen()
     data object Search : Screen()
 }
 
