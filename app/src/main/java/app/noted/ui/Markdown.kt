@@ -140,10 +140,10 @@ fun classifyLine(l: String): LineInfo {
 /* ---------- Reader blocks ---------- */
 
 sealed class Block {
-    data class Heading(val level: Int, val text: String, val raw: String) : Block()
-    data class Paragraph(val text: String) : Block()
-    data class Quote(val text: String) : Block()
-    data class Code(val text: String) : Block()
+    data class Heading(val level: Int, val text: String, val raw: String, val line: Int = 0) : Block()
+    data class Paragraph(val text: String, val line: Int = 0) : Block()
+    data class Quote(val text: String, val line: Int = 0) : Block()
+    data class Code(val text: String, val line: Int = 0) : Block()
     data object Rule : Block()
     data class ListBlock(val items: List<ListNode>) : Block()
 }
@@ -165,26 +165,28 @@ fun parseBlocks(src: String): List<Block> {
         val l = lines[i]
         when (info.kind) {
             LineKind.BLANK -> i++
-            LineKind.HEADING -> { out += Block.Heading(info.level, l.substring(info.prefixEnd).trimEnd().trimEnd('#').trimEnd(), headingKey(l)); i++ }
+            LineKind.HEADING -> { out += Block.Heading(info.level, l.substring(info.prefixEnd).trimEnd().trimEnd('#').trimEnd(), headingKey(l), i); i++ }
             LineKind.RULE -> { out += Block.Rule; i++ }
             LineKind.FENCE -> {
                 val sb = StringBuilder()
                 i++
+                val first = i
                 while (i < lines.size && infos[i].kind == LineKind.CODE) {
                     if (sb.isNotEmpty()) sb.append('\n')
                     sb.append(lines[i]); i++
                 }
                 if (i < lines.size && infos[i].kind == LineKind.FENCE) i++
-                out += Block.Code(sb.toString())
+                out += Block.Code(sb.toString(), first)
             }
             LineKind.CODE -> i++
             LineKind.QUOTE -> {
+                val first = i
                 val sb = StringBuilder()
                 while (i < lines.size && infos[i].kind == LineKind.QUOTE) {
                     if (sb.isNotEmpty()) sb.append('\n')
                     sb.append(lines[i].substring(infos[i].prefixEnd)); i++
                 }
-                out += Block.Quote(sb.toString())
+                out += Block.Quote(sb.toString(), first)
             }
             LineKind.BULLET, LineKind.NUMBER, LineKind.TASK -> {
                 val roots = mutableListOf<ListNode>()
@@ -211,16 +213,56 @@ fun parseBlocks(src: String): List<Block> {
                 out += Block.ListBlock(roots)
             }
             LineKind.TEXT -> {
+                val first = i
                 val sb = StringBuilder()
                 while (i < lines.size && infos[i].kind == LineKind.TEXT) {
                     if (sb.isNotEmpty()) sb.append('\n')
                     sb.append(lines[i].trimEnd()); i++
                 }
-                out += Block.Paragraph(sb.toString())
+                out += Block.Paragraph(sb.toString(), first)
             }
         }
     }
     return out
+}
+
+/**
+ * Where in the raw note a tap on rendered text lands. [shown] is the block's source text (lines joined
+ * with '\n', syntax still in) and [rendered] the offset in its rendered form; returns a raw-note offset.
+ * Each following line of the block starts at [firstLine] + k and its content begins after its own prefix.
+ */
+enum class SourceKind { PARAGRAPH, PREFIXED, CODE }
+
+fun sourceOffset(src: String, firstLine: Int, shown: String, rendered: Int, kind: SourceKind): Int {
+    val inline = kind != SourceKind.CODE
+    // Rendered offset -> offset in [shown] (inline syntax characters are hidden when rendered).
+    var off = rendered.coerceAtLeast(0)
+    if (inline) {
+        val spans = mutableListOf<InlineSpan>()
+        scanInline(shown, 0, shown.length, spans)
+        val hidden = BooleanArray(shown.length)
+        for (s in spans) if (s.kind == InlineKind.MARK || s.kind == InlineKind.URL) for (k in s.start until s.end) hidden[k] = true
+        var seen = 0
+        var k = 0
+        while (k < shown.length && (hidden[k] || seen < off)) { if (!hidden[k]) seen++; k++ }
+        off = k
+    }
+    off = off.coerceAtMost(shown.length)
+    val lineInBlock = shown.substring(0, off).count { it == '\n' }
+    val col = off - (shown.lastIndexOf('\n', off - 1) + 1)
+    val lines = src.split('\n')
+    val ln = (firstLine + lineInBlock).coerceIn(0, lines.size - 1)
+    val raw = lines[ln]
+    val info = classifyLine(raw)
+    val contentStart = when {
+        kind != SourceKind.PREFIXED -> 0
+        // Continuation lines of a list item are shown trimmed.
+        info.kind == LineKind.TEXT || info.kind == LineKind.BLANK -> raw.length - raw.trimStart().length
+        else -> info.prefixEnd
+    }
+    var start = 0
+    for (k in 0 until ln) start += lines[k].length + 1
+    return start + (contentStart + col).coerceAtMost(raw.length)
 }
 
 /** Flip the checkbox on one raw line. */

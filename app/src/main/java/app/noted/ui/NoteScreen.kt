@@ -4,7 +4,11 @@ import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -61,7 +65,7 @@ private fun startsWithH1(src: String): Boolean =
 
 @Composable
 fun NoteScreen(vm: AppViewModel, screen: Screen.Note) {
-    if (screen.editing) EditScreen(vm, screen.file) else ReadScreen(vm, screen.file)
+    if (screen.editing) EditScreen(vm, screen.file, screen.cursor) else ReadScreen(vm, screen.file)
 }
 
 @Composable
@@ -112,11 +116,16 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
                 if (t.isBlank()) {
                     Text("Empty note. Tap the pencil to start writing.", fontSize = 13.sp, color = C.Muted)
                 } else {
-                    MarkdownReader(t, folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) }, onToggleTask = { line ->
-                        val nt = toggleTaskLine(t, line)
-                        text = nt
-                        scope.launch(Dispatchers.IO) { writeSafe(file, nt); modified = file.lastModified() }
-                    })
+                    MarkdownReader(
+                        t, folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
+                        onToggleTask = { line ->
+                            val nt = toggleTaskLine(t, line)
+                            text = nt
+                            scope.launch(Dispatchers.IO) { writeSafe(file, nt); modified = file.lastModified() }
+                        },
+                        // Double-tap a line: open the editor with the caret right there.
+                        onEditAt = { at -> vm.replaceTop(Screen.Note(file, editing = true, cursor = at)) },
+                    )
                 }
                 Spacer(Modifier.height(18.dp))
                 Box(Modifier.fillMaxWidth().height(2.dp).background(C.Divider))
@@ -149,22 +158,35 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun EditScreen(vm: AppViewModel, file: File) {
+private fun EditScreen(vm: AppViewModel, file: File, cursor: Int?) {
     var value by remember(file) { mutableStateOf<TextFieldValue?>(null) }
     var saved by remember(file) { mutableStateOf("") }
     var history by remember(file) { mutableStateOf<History?>(null) }
     val focus = remember { FocusRequester() }
+    val reveal = remember { BringIntoViewRequester() }
+    var editorLayout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(file) {
         val t = withContext(Dispatchers.IO) { readSafe(file) }
-        val v = TextFieldValue(t, TextRange(t.length))
+        val at = (cursor ?: t.length).coerceIn(0, t.length)
+        val v = TextFieldValue(t, TextRange(at))
         saved = t
         history = History(v)
         value = v
         delay(50)
         try { focus.requestFocus() } catch (_: Exception) {}
+        if (cursor != null) {
+            // Scroll the caret into view, again once the keyboard has slid up and shrunk the page.
+            repeat(2) {
+                delay(if (it == 0) 30 else 350)
+                val l = editorLayout ?: return@repeat
+                val r = l.getCursorRect(at.coerceIn(0, l.layoutInput.text.length))
+                try { reveal.bringIntoView(r.inflate(48f)) } catch (_: Exception) {}
+            }
+        }
     }
 
     val v = value
@@ -237,7 +259,8 @@ private fun EditScreen(vm: AppViewModel, file: File) {
             LiveEditor(
                 v, { change(it) }, focus,
                 folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
-                modifier = Modifier.fillMaxWidth(),
+                onLayout = { editorLayout = it },
+                modifier = Modifier.fillMaxWidth().bringIntoViewRequester(reveal),
             )
             // Tapping below the text focuses the end of the note.
             Spacer(
