@@ -209,6 +209,113 @@ pub fn merge(base: &str, ours: &str, theirs: &str, cursor: usize) -> (String, us
     (ours.to_string(), cursor)
 }
 
+/* ---------- numbered lists ---------- */
+
+/// `(indent bytes, number, delimiter, end of the number in bytes)` for a numbered list line.
+fn num_item(l: &str) -> Option<(usize, u64, char, usize)> {
+    let w = l.len() - l.trim_start_matches([' ', '\t']).len();
+    let rest = &l[w..];
+    let d = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if d == 0 || d > 9 {
+        return None;
+    }
+    let delim = rest[d..].chars().next()?;
+    if delim != '.' && delim != ')' {
+        return None;
+    }
+    if !rest[d + 1..].chars().next().map(|c| c.is_whitespace()).unwrap_or(true) {
+        return None;
+    }
+    Some((w, rest[..d].parse().ok()?, delim, w + d))
+}
+
+/// Number every ordered list again, 1, 2, 3… from its lowest number, so moving, pasting or
+/// deleting items keeps it in order. A list runs on across blank lines and deeper-indented
+/// lines; anything else at its indent or less ends it. Code blocks are left alone.
+pub fn renumber(lines: &[&str]) -> Vec<String> {
+    struct Run {
+        indent: usize,
+        delim: char,
+        idx: Vec<usize>,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut fence = false;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        let is_fence = t.starts_with("```") || t.starts_with("~~~");
+        if fence {
+            if is_fence {
+                fence = false;
+            }
+            continue;
+        }
+        if l.trim().is_empty() {
+            continue;
+        }
+        if is_fence {
+            fence = true;
+        }
+        let ind = indent_of(l);
+        while stack.last().map(|&r| runs[r].indent > ind).unwrap_or(false) {
+            stack.pop();
+        }
+        let m = if is_fence { None } else { num_item(l) };
+        if let Some(&top) = stack.last() {
+            if runs[top].indent == ind {
+                if let Some((_, _, d, _)) = m {
+                    if d == runs[top].delim {
+                        runs[top].idx.push(i);
+                        continue;
+                    }
+                }
+                stack.pop();
+            }
+        }
+        if let Some((_, _, d, _)) = m {
+            runs.push(Run { indent: ind, delim: d, idx: vec![i] });
+            stack.push(runs.len() - 1);
+        }
+    }
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    for r in &runs {
+        let mut n = r.idx.iter().filter_map(|&i| num_item(lines[i]).map(|m| m.1)).min().unwrap_or(1);
+        for &i in &r.idx {
+            if let Some((w, _, _, end)) = num_item(lines[i]) {
+                out[i] = format!("{}{}{}", &lines[i][..w], n, &lines[i][end..]);
+            }
+            n += 1;
+        }
+    }
+    out
+}
+
+/// `text` with its ordered lists renumbered, and the char offsets `sel` moved to stay on
+/// the same characters.
+pub fn renumbered(text: &str, sel: (usize, usize)) -> (String, (usize, usize)) {
+    let old: Vec<&str> = text.split('\n').collect();
+    let new = renumber(&old);
+    if old.iter().zip(&new).all(|(a, b)| *a == b.as_str()) {
+        return (text.to_string(), sel);
+    }
+    let map = |c: usize| {
+        let (mut s, mut ns) = (0, 0);
+        for (i, l) in old.iter().enumerate() {
+            let (ol, nl) = (l.chars().count(), new[i].chars().count());
+            if c <= s + ol || i == old.len() - 1 {
+                let col = c.saturating_sub(s);
+                let w = ol - l.trim_start().chars().count();
+                let nc = if col <= w { col } else { ((col as isize + nl as isize - ol as isize).max(w as isize) as usize).min(nl) };
+                return ns + nc;
+            }
+            s += ol + 1;
+            ns += nl + 1;
+        }
+        c
+    };
+    (new.join("\n"), (map(sel.0), map(sel.1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +363,16 @@ mod tests {
         assert_eq!(merge("aaa\nbbb\nccc", "aaa\nbbb\nccc?", "aaa!\nbbb\nccc", 12), ("aaa!\nbbb\nccc?".into(), 13));
         // Same place: ours wins.
         assert_eq!(merge("abc", "aXc", "aYc", 2).0, "aXc");
+    }
+
+    #[test]
+    fn renumbering() {
+        let r = |t: &str| renumber(&t.split('\n').collect::<Vec<_>>()).join("\n");
+        assert_eq!(r("3. c\n1. a\n   - kid\n\n2. b\ntext\n1. x"), "1. c\n2. a\n   - kid\n\n3. b\ntext\n1. x");
+        assert_eq!(r("6. a\n5. b\n   2. in\n   1. in2\n7. c"), "5. a\n6. b\n   1. in\n   2. in2\n7. c");
+        assert_eq!(r("```\n3. no\n```"), "```\n3. no\n```");
+        let (t, s) = renumbered("10. a\n2. b", (9, 9));
+        assert_eq!(t, "2. a\n3. b");
+        assert_eq!(s, (8, 8));
     }
 }

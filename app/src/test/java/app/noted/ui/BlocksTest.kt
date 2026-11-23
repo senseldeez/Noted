@@ -48,4 +48,17 @@ class BlocksTest {
         assertEquals(19, r.selection.start)
         assertNull(applyBlockOp(v, 1, BlockOp.PASTE, emptySet(), "") {})
     }
+
+    @Test fun renumbering() {
+        assertEquals(ls("1. c\n2. a\n   - kid\n\n3. b\ntext\n1. x"), renumber(ls("3. c\n1. a\n   - kid\n\n2. b\ntext\n1. x")))
+        assertEquals(ls("5. a\n6. b\n   1. in\n   2. in2\n7. c"), renumber(ls("6. a\n5. b\n   2. in\n   1. in2\n7. c")))
+        assertEquals(ls("```\n3. no\n```"), renumber(ls("```\n3. no\n```")))
+        // Moving "1." down below "9." turns "9." into "10." and the cursor follows its text.
+        val t = (1..9).joinToString("\n") { "$it. i$it" }
+        val moved = t.lines().drop(1) + "1. i1"
+        val (out, c, _) = renumbered(moved.joinToString("\n"), moved.take(7).sumOf { it.length + 1 } + 4, 0)
+        assertEquals("8. i9", out.lines()[7])
+        assertEquals("9. i1", out.lines()[8])
+        assertEquals(out.lines().take(7).sumOf { it.length + 1 } + 4, c)
+    }
 }

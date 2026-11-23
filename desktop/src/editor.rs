@@ -181,9 +181,11 @@ impl Editor {
     }
 
     /// Replace the whole text as one undo step, with the cursor at `cursor`.
-    fn replace_text(&mut self, ctx: &egui::Context, text: String, cursor: (usize, usize)) {
+    /// Numbered lists are counted again first. Returns where the cursor ended up.
+    fn replace_text(&mut self, ctx: &egui::Context, text: String, cursor: (usize, usize)) -> (usize, usize) {
+        let (text, cursor) = blocks::renumbered(&text, cursor);
         if text == self.text {
-            return;
+            return cursor;
         }
         let cur = self.current(ctx);
         self.hist.push(cur);
@@ -192,6 +194,7 @@ impl Editor {
         }
         self.fut.clear();
         self.restore(ctx, Snap { text, sel: cursor });
+        cursor
     }
 
     /// Run a block-menu action on the block that line `line` starts.
@@ -218,7 +221,7 @@ impl Editor {
                 let t = rest.join("\n");
                 // The cursor goes to the start of whatever now fills the gap.
                 let at = rest[..blk.start.min(rest.len())].iter().map(|l| l.chars().count() + 1).sum::<usize>().min(t.chars().count());
-                self.replace_text(ctx, t, (at, at));
+                let _ = self.replace_text(ctx, t, (at, at));
             }
             BlockOp::Paste => {
                 // The clipboard goes in as lines of their own, right after the block.
@@ -234,7 +237,7 @@ impl Editor {
                 let t = out.join("\n");
                 let at = starts.get(blk.end).copied().unwrap_or(text.chars().count() + 1) + add.chars().count();
                 let at = at.min(t.chars().count());
-                self.replace_text(ctx, t, (at, at));
+                let _ = self.replace_text(ctx, t, (at, at));
             }
             BlockOp::Duplicate => {
                 let mut out: Vec<&str> = lines[..blk.end].to_vec();
@@ -243,14 +246,14 @@ impl Editor {
                 let t = out.join("\n");
                 let at = starts.get(blk.end).copied().unwrap_or(text.chars().count() + 1) + lines[blk.start].chars().count();
                 let at = at.min(t.chars().count());
-                self.replace_text(ctx, t, (at, at));
+                let _ = self.replace_text(ctx, t, (at, at));
             }
             BlockOp::Up | BlockOp::Down => {
                 let (hidden, _) = fold_info(&lines, folds);
                 if let Some((t, _, order)) = blocks::nudge(&lines, &blk, &hidden, op == BlockOp::Down) {
                     let a = remap_cursor(&lines, &order, sel.0);
                     let b = remap_cursor(&lines, &order, sel.1);
-                    self.replace_text(ctx, t, (a, b));
+                    let _ = self.replace_text(ctx, t, (a, b));
                 }
             }
         }
@@ -1703,7 +1706,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             let (t, _, order) = blocks::move_block(&lines, &blk, &us, gap);
             let s0 = e.last_sel.unwrap_or((post_cursor, post_cursor));
             let sel2 = (remap_cursor(&lines, &order, s0.0), remap_cursor(&lines, &order, s0.1));
-            e.replace_text(&ctx, t, sel2);
+            let sel2 = e.replace_text(&ctx, t, sel2);
             new_sel = Some(sel2);
             changed = true;
             force_hist = true;

@@ -292,7 +292,16 @@ private fun decorations(raw: String, active: IntRange, folded: Set<String>): Lis
 enum class BlockOp { CUT, COPY, PASTE, DUPLICATE, UP, DOWN, DELETE }
 
 /** Apply a block-menu action to the block holding line [line]. Returns the new value, or null. */
-fun applyBlockOp(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>, clip: String = "", copy: (String) -> Unit): TextFieldValue? {
+fun applyBlockOp(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>, clip: String = "", copy: (String) -> Unit): TextFieldValue? =
+    blockOpRaw(v, line, op, folded, clip, copy)?.let(::withListsRenumbered)
+
+/** [v] with its numbered lists counted again after blocks moved around. */
+fun withListsRenumbered(v: TextFieldValue): TextFieldValue {
+    val (t, a, b) = renumbered(v.text, v.selection.start, v.selection.end)
+    return if (t == v.text) v else TextFieldValue(t, TextRange(a, b))
+}
+
+private fun blockOpRaw(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>, clip: String, copy: (String) -> Unit): TextFieldValue? {
     val lines = v.text.split('\n')
     if (line !in lines.indices) return null
     val infos = classifyLines(lines)
@@ -517,7 +526,7 @@ fun LiveEditor(
         val v = latest
         val ls = v.text.split('\n')
         val m = moveBlock(ls, dd.block, dd.units, gap)
-        onValueChange(TextFieldValue(m.text, TextRange(remapOffset(ls, m.order, v.selection.start), remapOffset(ls, m.order, v.selection.end))))
+        onValueChange(withListsRenumbered(TextFieldValue(m.text, TextRange(remapOffset(ls, m.order, v.selection.start), remapOffset(ls, m.order, v.selection.end)))))
     }
 
     Box(

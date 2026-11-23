@@ -171,3 +171,70 @@ fun mergeNote(base: String, ours: String, theirs: String, cursor: Int): Pair<Str
     }
     return ours to cursor
 }
+
+/* ---------- numbered lists ---------- */
+
+private val NumRe = Regex("^([ \\t]*)(\\d{1,9})([.)])(?=\\s|$)")
+
+/**
+ * Number every ordered list again, 1, 2, 3… from its lowest number, so moving, pasting or
+ * deleting items keeps it in order. A list runs on across blank lines and deeper-indented
+ * lines; anything else at its indent or less ends it. Code blocks are left alone.
+ */
+fun renumber(lines: List<String>): List<String> {
+    class Run(val indent: Int, val delim: Char) { val idx = mutableListOf<Int>() }
+    val runs = mutableListOf<Run>()
+    val stack = ArrayList<Run>()
+    var fence = false
+    for ((i, l) in lines.withIndex()) {
+        val t = l.trimStart()
+        val isFence = t.startsWith("```") || t.startsWith("~~~")
+        if (fence) { if (isFence) fence = false; continue }
+        if (l.isBlank()) continue
+        if (isFence) fence = true
+        val ind = indentOf(l)
+        while (stack.isNotEmpty() && stack.last().indent > ind) stack.removeAt(stack.size - 1)
+        val m = if (isFence) null else NumRe.find(l)
+        val top = stack.lastOrNull()
+        if (top != null && top.indent == ind) {
+            if (m != null && m.groupValues[3][0] == top.delim) { top.idx += i; continue }
+            stack.removeAt(stack.size - 1)
+        }
+        if (m != null) Run(ind, m.groupValues[3][0]).also { it.idx += i; stack += it; runs += it }
+    }
+    val out = lines.toMutableList()
+    for (r in runs) {
+        var n = r.idx.minOf { NumRe.find(lines[it])!!.groupValues[2].toLong() }
+        for (i in r.idx) {
+            val m = NumRe.find(lines[i])!!
+            out[i] = m.groupValues[1] + n + lines[i].substring(m.groups[2]!!.range.last + 1)
+            n++
+        }
+    }
+    return out
+}
+
+/** Where offset [c] of [old] lands in [new], the same lines with some list numbers changed. */
+fun renumberOffset(old: List<String>, new: List<String>, c: Int): Int {
+    var s = 0
+    var ns = 0
+    for (i in old.indices) {
+        if (c <= s + old[i].length || i == old.size - 1) {
+            val col = c - s
+            val w = old[i].length - old[i].trimStart().length
+            val d = new[i].length - old[i].length
+            return ns + if (col <= w) col else (col + d).coerceIn(w, new[i].length)
+        }
+        s += old[i].length + 1
+        ns += new[i].length + 1
+    }
+    return c
+}
+
+/** [v] with its ordered lists renumbered, keeping the selection on the same characters. */
+fun renumbered(text: String, a: Int, b: Int): Triple<String, Int, Int> {
+    val old = text.split('\n')
+    val new = renumber(old)
+    if (new == old) return Triple(text, a, b)
+    return Triple(new.joinToString("\n"), renumberOffset(old, new, a), renumberOffset(old, new, b))
+}
