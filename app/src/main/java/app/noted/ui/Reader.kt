@@ -37,6 +37,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -51,7 +61,7 @@ import androidx.compose.ui.unit.sp
 val BoldStyle = SpanStyle(fontWeight = FontWeight.Bold, color = C.White)
 val ItalicStyle = SpanStyle(fontStyle = FontStyle.Italic)
 val StrikeStyle = SpanStyle(textDecoration = TextDecoration.LineThrough, color = C.Muted)
-val CodeStyle = SpanStyle(background = C.Guide, color = C.White, fontSize = 13.sp, fontFamily = Mono)
+val CodeStyle = SpanStyle(background = C.Guide, color = C.White, fontSize = CodeSize, fontFamily = Mono)
 val LinkStyle = SpanStyle(textDecoration = TextDecoration.Underline, color = C.White)
 
 /** Markdown inline -> styled text, with the syntax characters removed. */
@@ -120,12 +130,62 @@ fun MarkdownReader(
     folded: Set<String>,
     onToggleFold: (String) -> Unit,
     onToggleTask: (Int) -> Unit,
+    onEditAt: (Int) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val tree = remember(src) { buildTree(parseBlocks(src)) }
     val collapsed = remember { mutableStateMapOf<Int, Boolean>() }
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        tree.forEachIndexed { idx, n -> RenderNode(n, idx == 0, folded, onToggleFold, collapsed, onToggleTask) }
+    val edit = rememberUpdatedState(onEditAt)
+    val ctx = remember(src) { ReaderCtx(src) { edit.value(it) } }
+    var colY by remember { mutableStateOf(0f) }
+    Column(
+        modifier
+            .onGloballyPositioned { colY = it.positionInRoot().y }
+            // Double-tapping beside the text (margins, gaps between blocks) edits the nearest line
+            // above. Taps on the text itself are handled (and used up) by the text first.
+            .pointerInput(ctx) {
+                detectTapGestures(onDoubleTap = { pos ->
+                    val y = colY + pos.y
+                    val line = ctx.spans.entries.filter { it.value <= y }.maxByOrNull { it.value }?.key
+                        ?: ctx.spans.entries.minByOrNull { it.value }?.key ?: return@detectTapGestures
+                    ctx.editLineEnd(line)
+                })
+            },
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        tree.forEachIndexed { idx, n -> RenderNode(n, idx == 0, folded, onToggleFold, collapsed, onToggleTask, ctx) }
+    }
+}
+
+/** Lets each rendered block turn a double-tap into a caret position in the raw note. */
+private class ReaderCtx(val src: String, val onEditAt: (Int) -> Unit) {
+    /** Where each rendered block starts on screen (root y), by its first source line. */
+    val spans = HashMap<Int, Float>()
+    fun edit(firstLine: Int, shown: String, kind: SourceKind, rendered: Int) =
+        onEditAt(sourceOffset(src, firstLine, shown, rendered, kind))
+    fun editLineEnd(line: Int) {
+        val lines = src.split('\n')
+        if (line !in lines.indices) return
+        onEditAt(lines.take(line).sumOf { it.length + 1 } + lines[line].length)
+    }
+}
+
+/** Remember where a block starts, for double-taps beside it. */
+private fun Modifier.track(ctx: ReaderCtx, line: Int) = onGloballyPositioned { ctx.spans[line] = it.positionInRoot().y }
+
+/** Holds a Text's last layout so a tap position can be turned into a character offset. */
+private class LayoutRef { var value: TextLayoutResult? = null }
+
+/** Double-tap opens the editor at the tapped character; an optional single tap still works (e.g. folding). */
+@Composable
+private fun Modifier.editOnDoubleTap(ref: LayoutRef, onTap: (() -> Unit)? = null, onEdit: (Int) -> Unit): Modifier {
+    val tap = rememberUpdatedState(onTap)
+    val edit = rememberUpdatedState(onEdit)
+    return pointerInput(onTap != null) {
+        detectTapGestures(
+            onTap = if (onTap != null) { _ -> tap.value?.invoke() } else null,
+            onDoubleTap = { pos -> edit.value(ref.value?.getOffsetForPosition(pos) ?: 0) },
+        )
     }
 }
 
@@ -137,16 +197,18 @@ private fun RenderNode(
     onToggleFold: (String) -> Unit,
     collapsed: SnapshotStateMap<Int, Boolean>,
     onToggleTask: (Int) -> Unit,
+    ctx: ReaderCtx,
 ) {
     when (n) {
-        is Node.Leaf -> RenderBlock(n.block, collapsed, onToggleTask)
+        is Node.Leaf -> RenderBlock(n.block, collapsed, onToggleTask, ctx)
         is Node.Section -> {
             val b = n.heading
             val foldable = n.children.isNotEmpty()
             val closed = foldable && b.raw in folded
             Column {
-                Box(Modifier.padding(top = if (b.level > 1 && !first) 8.dp else 0.dp)) {
+                Box(Modifier.padding(top = if (b.level > 1 && !first) 8.dp else 0.dp).track(ctx, b.line)) {
                     if (foldable) FoldChevron(closed, Modifier.offset(x = (-30).dp, y = headingChevronY(b.level))) { onToggleFold(b.raw) }
+                    val ref = remember { LayoutRef() }
                     Text(
                         renderInline(b.text, true),
                         fontSize = headingSize(b.level),
@@ -154,10 +216,12 @@ private fun RenderNode(
                         fontWeight = if (b.level <= 2) FontWeight.ExtraBold else FontWeight.Bold,
                         letterSpacing = if (b.level == 1) (-0.4).sp else 0.sp,
                         color = if (b.level >= 4) C.Text2 else C.White,
-                        modifier = if (foldable) Modifier.clickable(
-                            interactionSource = null, indication = null,
-                            onClickLabel = if (closed) "Expand section" else "Collapse section",
-                        ) { onToggleFold(b.raw) } else Modifier,
+                        onTextLayout = { ref.value = it },
+                        modifier = Modifier.fillMaxWidth()
+                            .semantics { if (foldable) onClick(if (closed) "Expand section" else "Collapse section") { onToggleFold(b.raw); true } }
+                            .editOnDoubleTap(ref, if (foldable) ({ onToggleFold(b.raw) }) else null) {
+                                ctx.edit(b.line, b.text, SourceKind.PREFIXED, it)
+                            },
                     )
                 }
                 AnimatedVisibility(
@@ -166,7 +230,7 @@ private fun RenderNode(
                     exit = shrinkVertically(tween(200)) + fadeOut(tween(140)),
                 ) {
                     Column(Modifier.padding(top = 14.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                        n.children.forEach { RenderNode(it, false, folded, onToggleFold, collapsed, onToggleTask) }
+                        n.children.forEach { RenderNode(it, false, folded, onToggleFold, collapsed, onToggleTask, ctx) }
                     }
                 }
             }
@@ -178,35 +242,49 @@ private fun RenderNode(
 private fun headingChevronY(level: Int) = when (level) { 1 -> 0.dp; 2 -> (-1).dp; else -> (-2).dp }
 
 @Composable
-private fun RenderBlock(b: Block, collapsed: SnapshotStateMap<Int, Boolean>, onToggleTask: (Int) -> Unit) {
+private fun RenderBlock(b: Block, collapsed: SnapshotStateMap<Int, Boolean>, onToggleTask: (Int) -> Unit, ctx: ReaderCtx) {
+    val ref = remember { LayoutRef() }
     when (b) {
         is Block.Heading -> {}
-        is Block.Paragraph -> Text(renderInline(b.text, true), fontSize = 15.sp, lineHeight = 24.sp, color = C.Text2)
-        is Block.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
+        is Block.Paragraph -> Text(
+            renderInline(b.text, true), fontSize = BodySize, lineHeight = 25.sp, color = C.Text2,
+            onTextLayout = { ref.value = it },
+            modifier = Modifier.fillMaxWidth().track(ctx, b.line).editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.PARAGRAPH, it) },
+        )
+        is Block.Quote -> Row(Modifier.height(IntrinsicSize.Min).track(ctx, b.line)) {
             Box(Modifier.width(3.dp).fillMaxHeight().clip(RoundedCornerShape(2.dp)).background(C.White))
             Text(
-                renderInline(b.text, true), fontSize = 15.sp, lineHeight = 24.sp, color = C.Text3,
-                fontStyle = FontStyle.Italic, modifier = Modifier.padding(start = 14.dp, top = 2.dp, bottom = 2.dp),
+                renderInline(b.text, true), fontSize = BodySize, lineHeight = 25.sp, color = C.Text3,
+                fontStyle = FontStyle.Italic, onTextLayout = { ref.value = it },
+                modifier = Modifier.weight(1f).padding(start = 14.dp, top = 2.dp, bottom = 2.dp)
+                    .editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.PREFIXED, it) },
             )
         }
         is Block.Code -> Box(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(C.CodeBg)
+            Modifier.fillMaxWidth().track(ctx, b.line).clip(RoundedCornerShape(14.dp)).background(C.CodeBg)
                 .border(LineW, C.Guide, RoundedCornerShape(14.dp)).horizontalScroll(rememberScrollState()).padding(14.dp),
-        ) { Text(b.text, fontFamily = Mono, fontSize = 13.sp, lineHeight = 20.sp, color = C.Text2, softWrap = false) }
+        ) {
+            Text(
+                b.text, fontFamily = Mono, fontSize = CodeSize, lineHeight = 21.sp, color = C.Text2, softWrap = false,
+                onTextLayout = { ref.value = it },
+                modifier = Modifier.editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.CODE, it) },
+            )
+        }
         Block.Rule -> Box(Modifier.fillMaxWidth().padding(vertical = 4.dp).height(2.dp).background(C.Border))
         is Block.ListBlock -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             val g = b.items.any { it.children.isNotEmpty() }
-            b.items.forEach { ListItem(it, g, collapsed, onToggleTask) }
+            b.items.forEach { ListItem(it, g, collapsed, onToggleTask, ctx) }
         }
     }
 }
 
 @Composable
-private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<Int, Boolean>, onToggleTask: (Int) -> Unit) {
+private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<Int, Boolean>, onToggleTask: (Int) -> Unit, ctx: ReaderCtx) {
+    val ref = remember { LayoutRef() }
     val hasKids = n.children.isNotEmpty()
     val isClosed = collapsed[n.line] == true
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(verticalAlignment = Alignment.Top, modifier = if (gutter) Modifier.offset(x = (-10).dp) else Modifier) {
+        Row(verticalAlignment = Alignment.Top, modifier = (if (gutter) Modifier.offset(x = (-10).dp) else Modifier).track(ctx, n.line)) {
             // Chevron gutter (only items with children can fold).
             if (gutter) Box(
                 Modifier.size(28.dp).clip(RoundedCornerShape(14.dp))
@@ -229,17 +307,20 @@ private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<I
                     ) {
                         if (n.info.checked) Icon(Icons.Checkmark, null, tint = C.Black, modifier = Modifier.size(12.dp))
                     }
-                    LineKind.NUMBER -> Text(n.info.number, fontSize = 14.sp, color = C.Muted, modifier = Modifier.padding(end = 8.dp))
+                    LineKind.NUMBER -> Text(n.info.number, fontSize = 15.sp, color = C.Muted, modifier = Modifier.padding(end = 8.dp))
                     else -> Box(Modifier.padding(end = 10.dp).size(5.dp).clip(RoundedCornerShape(3.dp)).background(C.White))
                 }
             }
-            Column(Modifier.padding(top = 3.dp)) {
+            // The whole row to the right of the marker takes double-taps, not just the words.
+            Column(Modifier.weight(1f).padding(top = 3.dp).editOnDoubleTap(ref) { ctx.edit(n.line, n.text, SourceKind.PREFIXED, it) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        renderInline(n.text, true), fontSize = 15.sp, lineHeight = 22.sp,
+                        renderInline(n.text, true), fontSize = BodySize, lineHeight = 23.sp,
                         color = if (n.info.checked) C.Muted else C.White,
                         textDecoration = if (n.info.checked) TextDecoration.LineThrough else null,
-                        modifier = Modifier.weight(1f, fill = false),
+                        onTextLayout = { ref.value = it },
+                        modifier = Modifier.weight(1f, fill = false)
+                            .editOnDoubleTap(ref) { ctx.edit(n.line, n.text, SourceKind.PREFIXED, it) },
                     )
                     if (hasKids && isClosed) {
                         val count = countDescendants(n)
@@ -258,9 +339,9 @@ private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<I
         ) {
             Row(Modifier.height(IntrinsicSize.Min).padding(start = if (gutter) 3.dp else 2.dp)) {
                 Box(Modifier.width(2.dp).fillMaxHeight().background(C.Guide))
-                Column(Modifier.padding(start = 18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Column(Modifier.padding(start = 26.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     val g = n.children.any { it.children.isNotEmpty() }
-                    n.children.forEach { ListItem(it, g, collapsed, onToggleTask) }
+                    n.children.forEach { ListItem(it, g, collapsed, onToggleTask, ctx) }
                 }
             }
         }

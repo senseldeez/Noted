@@ -2,6 +2,7 @@
 //! edited, which sits on a rounded grey pill. Slash menu, toolbar and list shortcuts.
 use crate::app::App;
 use crate::icons::{self, Icon};
+use crate::blocks;
 use crate::md::{self, Block};
 use crate::reader::{self, format_for};
 use crate::store::{self, Item};
@@ -10,6 +11,9 @@ use crate::widgets::{self, MOD};
 use egui::text::{CCursor, CCursorRange, LayoutJob};
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Key, Modifiers, Rect, Sense, Shape, Stroke, StrokeKind, TextFormat, Ui};
 use std::collections::HashSet;
+use std::sync::Arc;
+use egui::Galley;
+use crate::hang;
 use std::path::PathBuf;
 
 const LH: f32 = 28.0;
@@ -64,6 +68,33 @@ pub struct Editor {
     snap: Snap,
     scrolled_for: Option<usize>,
     had_focus: bool,
+    /// A block being dragged by its handle.
+    drag: Option<BlockDrag>,
+    /// The line whose faint pill and handle show under the pointer.
+    hover_line: Option<usize>,
+}
+
+struct BlockDrag {
+    /// The block's lines.
+    block: std::ops::Range<usize>,
+    /// Pointer y minus the block's top, in screen space, when the drag began.
+    grab: f32,
+    /// Which handle started it, so the same widget keeps the drag.
+    handle: Id,
+    /// Tells one drag's slide animations from the next one's.
+    serial: i64,
+}
+
+/// What the block menu (the ⋮ handle) can do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockOp {
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Up,
+    Down,
+    Delete,
 }
 
 impl Editor {
@@ -91,6 +122,8 @@ impl Editor {
             last_push: 0.0,
             scrolled_for: None,
             had_focus: true,
+            drag: None,
+            hover_line: None,
         }
     }
 
@@ -147,6 +180,112 @@ impl Editor {
         ctx.request_repaint();
     }
 
+    /// Replace the whole text as one undo step, with the cursor at `cursor`.
+    /// Numbered lists are counted again first. Returns where the cursor ended up.
+    fn replace_text(&mut self, ctx: &egui::Context, text: String, cursor: (usize, usize)) -> (usize, usize) {
+        let (text, cursor) = blocks::renumbered(&text, cursor);
+        if text == self.text {
+            return cursor;
+        }
+        let cur = self.current(ctx);
+        self.hist.push(cur);
+        if self.hist.len() > 200 {
+            self.hist.remove(0);
+        }
+        self.fut.clear();
+        self.restore(ctx, Snap { text, sel: cursor });
+        cursor
+    }
+
+    /// Run a block-menu action on the block that line `line` starts.
+    pub fn block_op(&mut self, ctx: &egui::Context, op: BlockOp, line: usize, folds: &HashSet<String>) {
+        let text = self.text.clone();
+        let lines: Vec<&str> = text.split('\n').collect();
+        if line >= lines.len() {
+            return;
+        }
+        let blk = blocks::block_at(&lines, line);
+        let starts = line_starts(&lines);
+        let piece = lines[blk.clone()].join("\n");
+        let sel = self.current(ctx).sel;
+        match op {
+            BlockOp::Copy => {
+                ctx.copy_text(format!("{piece}\n"));
+            }
+            BlockOp::Cut | BlockOp::Delete => {
+                if op == BlockOp::Cut {
+                    ctx.copy_text(format!("{piece}\n"));
+                }
+                let mut rest: Vec<&str> = lines[..blk.start].to_vec();
+                rest.extend_from_slice(&lines[blk.end..]);
+                let t = rest.join("\n");
+                // The cursor goes to the start of whatever now fills the gap.
+                let at = rest[..blk.start.min(rest.len())].iter().map(|l| l.chars().count() + 1).sum::<usize>().min(t.chars().count());
+                let _ = self.replace_text(ctx, t, (at, at));
+            }
+            BlockOp::Paste => {
+                // The clipboard goes in as lines of their own, right after the block.
+                let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                let add = clip.replace("\r\n", "\n");
+                let add = add.trim_end_matches('\n');
+                if add.is_empty() {
+                    return;
+                }
+                let mut out: Vec<&str> = lines[..blk.end].to_vec();
+                out.extend(add.split('\n'));
+                out.extend_from_slice(&lines[blk.end..]);
+                let t = out.join("\n");
+                let at = starts.get(blk.end).copied().unwrap_or(text.chars().count() + 1) + add.chars().count();
+                let at = at.min(t.chars().count());
+                let _ = self.replace_text(ctx, t, (at, at));
+            }
+            BlockOp::Duplicate => {
+                let mut out: Vec<&str> = lines[..blk.end].to_vec();
+                out.extend_from_slice(&lines[blk.clone()]);
+                out.extend_from_slice(&lines[blk.end..]);
+                let t = out.join("\n");
+                let at = starts.get(blk.end).copied().unwrap_or(text.chars().count() + 1) + lines[blk.start].chars().count();
+                let at = at.min(t.chars().count());
+                let _ = self.replace_text(ctx, t, (at, at));
+            }
+            BlockOp::Up | BlockOp::Down => {
+                let (hidden, _) = fold_info(&lines, folds);
+                if let Some((t, _, order)) = blocks::nudge(&lines, &blk, &hidden, op == BlockOp::Down) {
+                    let a = remap_cursor(&lines, &order, sel.0);
+                    let b = remap_cursor(&lines, &order, sel.1);
+                    let _ = self.replace_text(ctx, t, (a, b));
+                }
+            }
+        }
+    }
+
+    /// The note changed on disk (a sync app wrote it). Take the new text in, keeping edits
+    /// made here since the last save and the cursor.
+    pub fn sync_from_disk(&mut self, ctx: &egui::Context, disk: &str) {
+        let disk = disk.trim_end_matches('\n').to_string();
+        if disk == self.saved_text {
+            return;
+        }
+        let sel = self.current(ctx).sel;
+        let (merged, c1) = blocks::merge(&self.saved_text, &self.text, &disk, sel.1);
+        let (_, c0) = blocks::merge(&self.saved_text, &self.text, &disk, sel.0);
+        let n = merged.chars().count();
+        self.saved_text = disk;
+        if merged != self.text {
+            self.hist.push(self.current(ctx));
+            self.fut.clear();
+            self.text = merged;
+            let id = editor_id(&self.path);
+            set_cursor(ctx, id, c0.min(n), c1.min(n));
+            self.last_sel = Some((c0.min(n), c1.min(n)));
+            self.snap = Snap { text: self.text.clone(), sel: (c0.min(n), c1.min(n)) };
+        }
+        // Local edits that the merge kept still need saving.
+        self.dirty_since = if self.text != self.saved_text { Some(ctx.input(|i| i.time)) } else { None };
+        self.drag = None;
+        ctx.request_repaint();
+    }
+
     pub fn undo(&mut self, ctx: &egui::Context) {
         if let Some(s) = self.hist.pop() {
             let cur = self.current(ctx);
@@ -165,6 +304,32 @@ impl Editor {
 }
 
 /* ---------- text helpers (char indices) ---------- */
+
+/// Char index where each line starts.
+fn line_starts(lines: &[&str]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut acc = 0;
+    for l in lines {
+        out.push(acc);
+        acc += l.chars().count() + 1;
+    }
+    out
+}
+
+/// Where char `c` of the old text lands after its lines were reordered (`order[new] = old`).
+fn remap_cursor(lines: &[&str], order: &[usize], c: usize) -> usize {
+    let starts = line_starts(lines);
+    let li = starts.iter().rposition(|&s| s <= c).unwrap_or(0);
+    let col = c - starts[li];
+    let mut acc = 0;
+    for &o in order {
+        if o == li {
+            return acc + col.min(lines[o].chars().count());
+        }
+        acc += lines[o].chars().count() + 1;
+    }
+    c
+}
 
 fn byte_at(s: &str, ci: usize) -> usize {
     s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
@@ -756,6 +921,59 @@ fn styles_at(text: &str, at: usize) -> (Block, bool, bool, bool) {
     st
 }
 
+/// Space kept free at the right of the text for the block handle.
+const HANDLE_ROOM: f32 = 22.0;
+/// Selected text sits on a soft white highlight with rounded corners.
+const SELECTION: Color32 = Color32::from_rgba_premultiplied(70, 70, 70, 70);
+
+/// Where a line's text starts after its indent and marker, so wrapped rows line up with it.
+fn hang_points(lines: &[&str], hidden: &HashSet<usize>) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut fence = false;
+    for (i, l) in lines.iter().enumerate() {
+        let c = md::classify(l);
+        let is_fence = c.block == Block::Fence;
+        let code = fence || is_fence;
+        if is_fence {
+            fence = !fence;
+        }
+        out.push(if code || hidden.contains(&i) {
+            None
+        } else {
+            match c.block {
+                Block::Bullet | Block::Number | Block::Task(_) | Block::Quote => Some(c.content.start),
+                Block::Plain if c.indent > 0 => Some(c.indent),
+                _ => None,
+            }
+        });
+    }
+    out
+}
+
+/// The active-line pill: a near-black card with a fine light outline.
+fn pill_shapes(r: Rect, a: f32) -> [Shape; 2] {
+    [
+        Shape::rect_filled(r, 12, Color32::from_gray(0x11).gamma_multiply(a)),
+        Shape::rect_stroke(r, 12, Stroke::new(1.0, Color32::from_gray(0x2a).gamma_multiply(a)), StrokeKind::Inside),
+    ]
+}
+
+/// The block handle's spot: inside the pill's right end, centred on the line's first row.
+fn handle_rect(pill_right: f32, line_top: f32) -> Rect {
+    // The pill is one line (LH) tall; keep 4px of it showing around the handle on every side.
+    Rect::from_center_size(pos2(pill_right - 4.0 - 11.0, line_top + LH / 2.0), vec2(22.0, LH - 8.0))
+}
+
+fn paint_handle(p: &egui::Painter, r: Rect, a: f32, hover: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    let bg = widgets::lerp_color(Color32::from_gray(0x1f), Color32::from_gray(0x2e), hover);
+    p.rect_filled(r, 7, bg.gamma_multiply(a));
+    let fg = widgets::lerp_color(Color32::from_gray(0xb5), WHITE, hover);
+    icons::paint(p, Rect::from_center_size(r.center(), vec2(14.0, 14.0)), Icon::Grip, fg.gamma_multiply(a));
+}
+
 /// Key hint chip drawn from its left edge; returns its width.
 fn chip(p: &egui::Painter, x: f32, cy: f32, text: &str) -> f32 {
     let g = p.layout_no_wrap(text.into(), mono(11.0), TEXT2);
@@ -1020,6 +1238,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             } else if k(cmd, Key::Z) {
                 e.undo(&ctx);
                 new_sel = Some(e.snap.sel);
+            } else if k(Modifiers::ALT, Key::ArrowUp) || k(Modifiers::ALT, Key::ArrowDown) {
+                let down = ctx.input(|i| i.key_down(Key::ArrowDown));
+                let li = line_index(&e.text, byte_at(&e.text, s.1));
+                e.block_op(&ctx, if down { BlockOp::Down } else { BlockOp::Up }, li, &folds);
+                new_sel = Some(e.snap.sel);
             } else if k(cmd, Key::Slash) {
                 e.palette = Some(Palette::new(PalMode::Input { query: String::new(), at: s, focus: true }, now));
             } else if s.0 == s.1 && ctx.input(|i| i.key_pressed(Key::Enter) && i.modifiers.is_none()) {
@@ -1066,7 +1289,16 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     let mut pal_anchor: Option<Rect> = None;
     let mut boxes = Vec::new();
     let mut post_cursor = cur_now;
+    let _ = &mut post_cursor;
     let title = if starts_with_h1(&e.text) { None } else { Some(e.title.clone()) };
+    let mut drop_at: Option<(std::ops::Range<usize>, usize, usize)> = None;
+    let mut menu_req: Option<(Rect, usize)> = None;
+    let mut handles: Vec<(Rect, usize, Id, f32)> = Vec::new();
+    let mut lift_bg: Vec<Shape> = Vec::new();
+    let mut sel_shapes: Vec<Shape> = Vec::new();
+    if e.drag.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        e.drag = None;
+    }
 
     egui::ScrollArea::vertical().id_salt(("editor-scroll", &e.path)).auto_shrink([false, false]).show(ui, |ui| {
         let avail = ui.available_width();
@@ -1086,47 +1318,130 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let top = ui.cursor().min.y;
         let bg_idx = ui.painter().add(Shape::Noop);
         let mut decos: Vec<Deco> = Vec::new();
-        let out = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(x0, top), vec2(w, f32::INFINITY))), |ui| {
-                let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                    let t = buf.as_str();
-                    let lines: Vec<&str> = t.split('\n').collect();
-                    let (hidden, _) = fold_info(&lines, &folds);
-                    let m = |s: &str, f: &FontId| ui.fonts_mut(|fo| fo.layout_no_wrap(s.to_string(), f.clone(), WHITE).size().x);
-                    let (job, d) = build(t, active, &hidden, wrap, &m);
-                    decos = d;
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
-                egui::TextEdit::multiline(&mut e.text)
-                    .id(id)
-                    .font(sans(16.0))
-                    .text_color(TEXT2)
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::ZERO)
-                    .desired_width(w)
-                    .desired_rows(1)
-                    .lock_focus(true)
-                    .hint_text(egui::RichText::new("Start writing…  type / for formatting").font(sans(16.0)).color(Color32::from_gray(0x55)))
-                    .layouter(&mut layouter)
-                    .show(ui)
-            })
-            .inner;
-        if out.response.response.changed() {
-            changed = true;
-        }
-        post_cursor = out.cursor_range.map(|r| r.primary.index.0).unwrap_or(cur_now).min(e.text.chars().count());
-        let g = out.galley.clone();
-        let gp = out.galley_pos;
-        let painter = ui.painter();
-        let row_rect = |ci: usize| -> Rect { g.pos_from_cursor(CCursor::new(ci)).translate(gp.to_vec2()) };
+        let dragging = e.drag.is_some();
+        // Text wraps a little short of the column so the block handle has room.
+        let tw = (w - HANDLE_ROOM).max(80.0);
+        let lay = |ui: &Ui, t: &str, wrap: f32, decos: &mut Vec<Deco>| -> Arc<Galley> {
+            let lines: Vec<&str> = t.split('\n').collect();
+            let (hidden, _) = fold_info(&lines, &folds);
+            let m = |s: &str, f: &FontId| ui.fonts_mut(|fo| fo.layout_no_wrap(s.to_string(), f.clone(), WHITE).size().x);
+            let (job, d) = build(t, active, &hidden, wrap, &m);
+            *decos = d;
+            hang::layout(ui, job, &hang_points(&lines, &hidden))
+        };
+        let mut te_out = None;
+        let (g, gp) = if !dragging {
+            let out = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(x0, top), vec2(w, f32::INFINITY))), |ui| {
+                    // The selection is painted below as rounded highlights instead.
+                    ui.visuals_mut().selection.bg_fill = Color32::TRANSPARENT;
+                    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| lay(ui, buf.as_str(), wrap, &mut decos);
+                    egui::TextEdit::multiline(&mut e.text)
+                        .id(id)
+                        .font(sans(16.0))
+                        .text_color(TEXT2)
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::ZERO)
+                        .desired_width(tw)
+                        .desired_rows(1)
+                        .lock_focus(true)
+                        .hint_text(egui::RichText::new("Start writing…  type / for formatting").font(sans(16.0)).color(Color32::from_gray(0x55)))
+                        .layouter(&mut layouter)
+                        .show(ui)
+                })
+                .inner;
+            if out.response.response.changed() {
+                changed = true;
+            }
+            post_cursor = out.cursor_range.map(|r| r.primary.index.0).unwrap_or(cur_now).min(e.text.chars().count());
+            let r = (out.galley.clone(), out.galley_pos);
+            te_out = Some(out);
+            r
+        } else {
+            // While a block is dragged the text is painted piece by piece, so it isn't edited.
+            let g = lay(ui, &e.text, tw, &mut decos);
+            let (r, _) = ui.allocate_exact_size(vec2(avail, g.size().y.max(LH)), Sense::hover());
+            (g, pos2(x0, r.min.y))
+        };
         let lines: Vec<&str> = e.text.split('\n').collect();
-        let mut starts = Vec::with_capacity(lines.len());
-        let mut acc = 0;
-        for l in &lines {
-            starts.push(acc);
-            acc += l.chars().count() + 1;
-        }
+        let starts = line_starts(&lines);
+        let acc = starts.last().map(|s| s + lines.last().map(|l| l.chars().count()).unwrap_or(0) + 1).unwrap_or(0);
         let cur_line = line_index(&e.text, byte_at(&e.text, post_cursor));
+        let (hidden_now, heads) = fold_info(&lines, &folds);
+
+        // Each line's rows, and its top and bottom relative to the galley.
+        let mut line_rows: Vec<std::ops::Range<usize>> = vec![0..0; lines.len()];
+        {
+            let mut li = 0;
+            let mut first = 0;
+            for (ri, row) in g.rows.iter().enumerate() {
+                if row.ends_with_newline || ri + 1 == g.rows.len() {
+                    if li < line_rows.len() {
+                        line_rows[li] = first..ri + 1;
+                    }
+                    li += 1;
+                    first = ri + 1;
+                }
+            }
+        }
+        let ltop = |li: usize| g.rows.get(line_rows[li].start).map(|r| r.pos.y).unwrap_or(0.0);
+        let lbot = |li: usize| line_rows[li].clone().last().and_then(|r| g.rows.get(r)).map(|r| r.pos.y + r.size.y).unwrap_or(0.0);
+        let line_of = |ci: usize| starts.partition_point(|&s| s <= ci).saturating_sub(1).min(lines.len().saturating_sub(1));
+
+        // Dragging: where every other piece slides to, and where the block would land.
+        let mut off = vec![0.0f32; lines.len()];
+        let mut lifted: Option<(std::ops::Range<usize>, f32)> = None;
+        if let Some(d) = &e.drag {
+            let blk = d.block.start.min(lines.len())..d.block.end.min(lines.len());
+            let ptr = ctx.input(|i| i.pointer.latest_pos()).map(|p| p.y).unwrap_or(gp.y + ltop(blk.start) + d.grab);
+            let (btop, bbot) = (ltop(blk.start), lbot(blk.end.saturating_sub(1).max(blk.start)));
+            let hgt = bbot - btop;
+            let want = ptr - d.grab - gp.y;
+            let centre = want + hgt / 2.0;
+            let us = blocks::units(&lines, &blk, &hidden_now);
+            let mut gap = 0;
+            for (j, u) in us.iter().enumerate() {
+                let (ut, ub) = (ltop(u.start), lbot(u.end - 1));
+                let ct = if ut >= bbot { ut - hgt } else { ut };
+                if ct + (ub - ut) / 2.0 < centre {
+                    gap = j + 1;
+                }
+            }
+            for (j, u) in us.iter().enumerate() {
+                let ut = ltop(u.start);
+                let ct = if ut >= bbot { ut - hgt } else { ut };
+                let target = ct + if j >= gap { hgt } else { 0.0 } - ut;
+                let o = ctx.animate_value_with_time(id.with(("unit", d.serial, u.start)), target, 0.16);
+                for li in u.clone() {
+                    off[li] = o;
+                }
+            }
+            for li in blk.clone() {
+                off[li] = want - btop;
+            }
+            lifted = Some((blk.clone(), want - btop));
+            // Scroll when the block is held near the top or bottom edge.
+            let clip = ui.clip_rect();
+            if ptr < clip.min.y + 40.0 {
+                ui.scroll_with_delta(vec2(0.0, 10.0));
+            } else if ptr > clip.max.y - 110.0 {
+                ui.scroll_with_delta(vec2(0.0, -10.0));
+            }
+            ctx.request_repaint();
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                drop_at = Some((blk, gap, blocks::home_gap(&d.block, &us)));
+            }
+        }
+        let row_rect = |ci: usize| -> Rect { g.pos_from_cursor(CCursor::new(ci)).translate(gp.to_vec2() + vec2(0.0, off[line_of(ci)])) };
+        let lift_layer = egui::LayerId::new(egui::Order::Middle, id.with("lifted"));
+        let lift_painter = ctx.layer_painter(lift_layer).with_clip_rect(ui.clip_rect());
+        let base_painter = ui.painter().clone();
+        let pnt = |li: usize| -> &egui::Painter {
+            match &lifted {
+                Some((b, _)) if b.contains(&li) => &lift_painter,
+                _ => &base_painter,
+            }
+        };
 
         // Background: code blocks, then the active-line pill.
         let mut bg = Vec::new();
@@ -1141,28 +1456,119 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     let top = block.take().unwrap_or(r0.min.y);
                     let r1 = row_rect(d.end);
                     let r = Rect::from_min_max(pos2(gp.x - 10.0, top), pos2(gp.x + w + 10.0, r1.max.y));
-                    bg.push(Shape::rect_filled(r, 12, CODE));
-                    bg.push(Shape::rect_stroke(r, 12, Stroke::new(2.0, GUIDE), StrokeKind::Inside));
+                    let shapes = [Shape::rect_filled(r, 12, CODE), Shape::rect_stroke(r, 12, Stroke::new(2.0, GUIDE), StrokeKind::Inside)];
+                    if lifted.as_ref().map(|(b, _)| b.contains(&d.line)).unwrap_or(false) {
+                        lift_bg.extend(shapes);
+                    } else {
+                        bg.extend(shapes);
+                    }
                 }
             }
         }
-        {
-            let ls = starts.get(cur_line).copied().unwrap_or(0);
-            let le = ls + lines.get(cur_line).map(|l| l.chars().count()).unwrap_or(0);
-            let r0 = row_rect(ls);
-            let r1 = row_rect(le);
-            let ty = ctx.animate_value_with_time(id.with("pill-top"), r0.min.y - gp.y, 0.18);
-            let th = ctx.animate_value_with_time(id.with("pill-h"), (r1.max.y - r0.min.y).max(LH), 0.18);
-            let pill = Rect::from_min_size(pos2(gp.x - 14.0, gp.y + ty), vec2(w + 28.0, th));
-            bg.push(Shape::rect_filled(pill, 14, PILL));
-            cursor_screen = Some(row_rect(post_cursor));
+
+        // Rounded selection highlights.
+        if let Some(cr) = te_out.as_ref().and_then(|o| o.cursor_range) {
+            let (a, b) = (cr.primary.index.0.min(cr.secondary.index.0), cr.primary.index.0.max(cr.secondary.index.0));
+            if a < b {
+                let mut rs = 0usize;
+                for row in &g.rows {
+                    let n = row.char_count_excluding_newline().0;
+                    let re = rs + n + usize::from(row.ends_with_newline);
+                    if a < re.max(rs + 1) && b > rs {
+                        let x = |i: usize| -> f32 {
+                            let k = i - rs;
+                            row.pos.x + row.glyphs.get(k).map(|gl| gl.pos.x).unwrap_or(row.size.x)
+                        };
+                        let xa = x(a.max(rs));
+                        let xb = if b > rs + n { row.pos.x + row.size.x + 5.0 } else { x(b) };
+                        if xb > xa {
+                            let r = Rect::from_min_max(pos2(gp.x + xa - 1.0, gp.y + row.pos.y + 3.0), pos2(gp.x + xb + 1.0, gp.y + row.pos.y + row.size.y - 3.0));
+                            sel_shapes.push(Shape::rect_filled(r, 6, SELECTION));
+                        }
+                    }
+                    rs = re;
+                }
+            }
         }
+
+        // The pill behind the line being edited, with the block handle at its right end.
+        let pill_x0 = gp.x - 14.0;
+        let pill_x1 = gp.x + w + 14.0;
+        if !dragging {
+            let r0t = ltop(cur_line.min(lines.len() - 1));
+            let r1b = lbot(cur_line.min(lines.len() - 1));
+            let ty = ctx.animate_value_with_time(id.with("pill-top"), r0t, 0.18);
+            let th = ctx.animate_value_with_time(id.with("pill-h"), (r1b - r0t).max(LH), 0.18);
+            let pill = Rect::from_min_max(pos2(pill_x0, gp.y + ty), pos2(pill_x1, gp.y + ty + th));
+            bg.extend(pill_shapes(pill, 1.0));
+            cursor_screen = Some(row_rect(post_cursor));
+            let hr = handle_rect(pill_x1, gp.y + ty);
+            handles.push((hr, cur_line, id.with("handle-active"), 1.0));
+        }
+        // Hovering another line shows a faint pill and its handle too.
+        let hover_ptr = ctx.input(|i| i.pointer.hover_pos()).filter(|p| ui.clip_rect().contains(*p));
+        if !dragging && e.palette.is_none() {
+            if let Some(p) = hover_ptr {
+                let area = Rect::from_min_max(pos2(pill_x0 - 20.0, gp.y), pos2(pill_x1, gp.y + g.size().y.max(LH)));
+                let hl = if area.contains(p) { (0..lines.len()).find(|&li| !hidden_now.contains(&li) && p.y - gp.y >= ltop(li) && p.y - gp.y < lbot(li)) } else { None };
+                let hid = id.with("handle-hover");
+                // Keep the hovered handle while the pointer travels onto it.
+                let held = e.hover_line.filter(|&l| l < lines.len() && handle_rect(pill_x1, gp.y + ltop(l)).expand(6.0).contains(p));
+                if let Some(hl) = held.or(hl).filter(|&l| l != cur_line) {
+                    e.hover_line = Some(hl);
+                    let t = ctx.animate_bool_with_time(id.with(("hover-line", hl)), true, 0.12);
+                    let pill = Rect::from_min_max(pos2(pill_x0, gp.y + ltop(hl)), pos2(pill_x1, gp.y + lbot(hl).max(ltop(hl) + LH)));
+                    bg.extend(pill_shapes(pill, 0.45 * t));
+                    handles.push((handle_rect(pill_x1, gp.y + ltop(hl)), hl, hid, t));
+                } else {
+                    e.hover_line = None;
+                }
+            }
+        }
+        // The dragged block floats above the rest on its own pill, with a soft shadow.
+        if let Some((b, o)) = &lifted {
+            let top = gp.y + ltop(b.start) + o;
+            let bot = gp.y + lbot(b.end.saturating_sub(1).max(b.start)) + o;
+            let r = Rect::from_min_max(pos2(pill_x0, top), pos2(pill_x1, bot.max(top + LH)));
+            let sh = egui::epaint::Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(220) };
+            lift_bg.insert(0, sh.as_shape(r, 12).into());
+            lift_bg.insert(1, Shape::rect_filled(r, 12, Color32::from_gray(0x17)));
+            lift_bg.insert(2, Shape::rect_stroke(r, 12, Stroke::new(1.0, Color32::from_gray(0x38)), StrokeKind::Inside));
+            if let Some(d) = &e.drag {
+                handles.push((handle_rect(pill_x1, top), b.start, d.handle, 1.0));
+            }
+        }
+        bg.extend(sel_shapes.drain(..));
         ui.painter().set(bg_idx, Shape::Vec(bg));
+
+        // While dragging, paint the text in pieces, each at its own offset.
+        if dragging {
+            let mut li = 0;
+            while li < lines.len() {
+                let o = off[li];
+                let lift = lifted.as_ref().map(|(b, _)| b.contains(&li)).unwrap_or(false);
+                let mut lj = li + 1;
+                while lj < lines.len() && (off[lj] - o).abs() < 0.25 && lifted.as_ref().map(|(b, _)| b.contains(&lj)).unwrap_or(false) == lift {
+                    lj += 1;
+                }
+                let rows = line_rows[li].start..line_rows[lj - 1].end;
+                if !rows.is_empty() {
+                    let piece = hang::rows_galley(&g, rows);
+                    let p = if lift { &lift_painter } else { &base_painter };
+                    if lift {
+                        p.extend(std::mem::take(&mut lift_bg));
+                    }
+                    p.galley(gp + vec2(0.0, o), piece, TEXT2);
+                }
+                li = lj;
+            }
+        }
 
         // Foreground decorations replace the hidden markers.
         for d in &decos {
             let r = row_rect(d.at);
             let cy = r.min.y + LH / 2.0;
+            let painter = pnt(d.line);
             match d.kind {
                 DecoKind::Dot => {
                     painter.circle_filled(pos2(r.min.x + 2.5, cy), 2.5, WHITE);
@@ -1194,8 +1600,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
 
         // Fold chevrons beside foldable headings.
-        let (hidden_now, heads) = fold_info(&lines, &folds);
         for (li, closed) in heads {
+            let painter = pnt(li);
             let r = row_rect(starts[li]);
             let cr = Rect::from_center_size(pos2(gp.x - 34.0 + 14.0, r.min.y + LH / 2.0), vec2(28.0, 28.0));
             let resp = ui.interact(cr, id.with(("chev", li)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1211,8 +1617,40 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             }
         }
 
+        // Block handles: drag to move the block, click for its menu.
+        let mut start_drag = None;
+        for (hr, line, hid, t) in std::mem::take(&mut handles) {
+            let resp = ui
+                .interact(hr, hid, Sense::click_and_drag())
+                .on_hover_cursor(if dragging { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            let p = pnt(line);
+            let hov = ctx.animate_bool_with_time(hid.with(("h", line)), resp.hovered() || dragging, 0.12);
+            paint_handle(p, hr, t, hov);
+            if resp.hovered() && !dragging {
+                // Outline what moves with it.
+                let blk = blocks::block_at(&lines, line);
+                if blk.len() > 1 {
+                    let r = Rect::from_min_max(pos2(pill_x0, gp.y + ltop(blk.start)), pos2(pill_x1, gp.y + lbot(blk.end - 1)));
+                    p.rect_stroke(r, 12, Stroke::new(1.0, Color32::from_gray(0x3a)), StrokeKind::Inside);
+                }
+                widgets::tip(ui, &resp, "Drag to move · click for actions", "", true);
+            }
+            if !dragging && resp.drag_started() {
+                let blk = blocks::block_at(&lines, line);
+                let py = resp.interact_pointer_pos().map(|p| p.y).unwrap_or(hr.center().y);
+                start_drag = Some(BlockDrag { block: blk.clone(), grab: py - (gp.y + ltop(blk.start)), handle: hid, serial: (now * 1000.0) as i64 });
+            } else if !dragging && resp.clicked() {
+                menu_req = Some((hr, line));
+            }
+        }
+        if start_drag.is_some() {
+            e.drag = start_drag;
+            e.hover_line = None;
+            ctx.request_repaint();
+        }
+
         // The cursor never rests inside a folded section.
-        if hidden_now.contains(&cur_line) {
+        if !dragging && hidden_now.contains(&cur_line) {
             let mut h = cur_line;
             while h > 0 && hidden_now.contains(&h) {
                 h -= 1;
@@ -1232,7 +1670,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         }
 
         // Keep the line being edited clear of the toolbar.
-        if let Some(cr) = cursor_screen {
+        if let Some(cr) = cursor_screen.filter(|_| !dragging) {
             if (changed || e.scrolled_for != Some(post_cursor)) && (focused || new_sel.is_some()) {
                 let clip = ui.clip_rect();
                 if cr.max.y > clip.max.y - 90.0 {
@@ -1249,13 +1687,36 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if tail.clicked() {
             let n = e.text.chars().count();
             set_cursor(&ctx, id, n, n);
-            out.response.response.request_focus();
+            ctx.memory_mut(|m| m.request_focus(id));
         }
         if tail.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::Text);
         }
     });
     e.boxes = boxes;
+
+    // Drop a dragged block into its new place.
+    if let Some((blk, gap, home)) = drop_at {
+        e.drag = None;
+        if gap != home {
+            let text = e.text.clone();
+            let lines: Vec<&str> = text.split('\n').collect();
+            let (hidden, _) = fold_info(&lines, &folds);
+            let us = blocks::units(&lines, &blk, &hidden);
+            let (t, _, order) = blocks::move_block(&lines, &blk, &us, gap);
+            let s0 = e.last_sel.unwrap_or((post_cursor, post_cursor));
+            let sel2 = (remap_cursor(&lines, &order, s0.0), remap_cursor(&lines, &order, s0.1));
+            let sel2 = e.replace_text(&ctx, t, sel2);
+            new_sel = Some(sel2);
+            changed = true;
+            force_hist = true;
+            // replace_text already recorded the undo step.
+            e.snap = Snap { text: e.text.clone(), sel: sel2 };
+        } else {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        ctx.request_repaint();
+    }
 
     // Tick a checkbox and put the cursor back where it was.
     if let Some(line) = tick {
@@ -1623,6 +2084,23 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     }
     e.snap.sel = end_sel;
     e.had_focus = ctx.memory(|m| m.has_focus(id));
+
+    if let Some((hr, line)) = menu_req {
+        use crate::app::{mi, sep, Action, MenuAt};
+        let b = |op| Action::Block(op, line);
+        let items = vec![
+            mi(Icon::Cut, "Cut", "", b(BlockOp::Cut)),
+            mi(Icon::Copy, "Copy", "", b(BlockOp::Copy)),
+            mi(Icon::Paste, "Paste below", "", b(BlockOp::Paste)),
+            mi(Icon::Duplicate, "Duplicate", "", b(BlockOp::Duplicate)),
+            sep(),
+            mi(Icon::ArrowUp, "Move up", "Alt ↑", b(BlockOp::Up)),
+            mi(Icon::ArrowDown, "Move down", "Alt ↓", b(BlockOp::Down)),
+            sep(),
+            mi(Icon::Trash, "Delete", "", b(BlockOp::Delete)),
+        ];
+        app.open_bar(ui, MenuAt::Above(hr), items);
+    }
 
     if let Some(k) = fold_toggle {
         let f = app.folds.entry(path).or_default();

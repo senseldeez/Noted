@@ -48,6 +48,8 @@ pub enum Action {
     ClearSelection,
     Undo,
     Redo,
+    /// A block-menu action on the block starting at this line of the open note.
+    Block(crate::editor::BlockOp, usize),
 }
 
 pub struct MenuItem {
@@ -77,6 +79,8 @@ pub struct Menu {
     pub items: Vec<MenuItem>,
     pub opened_at: f64,
     pub hl: Option<usize>,
+    /// A compact row of icons (labels as tooltips) instead of a list.
+    pub row: bool,
 }
 
 pub enum Dialog {
@@ -126,6 +130,10 @@ pub struct App {
     dialog_focus: bool,
     view_key: String,
     view_at: f64,
+    /// The open note's last seen size and time on disk, whether it changed since the last
+    /// look, and when we last looked.
+    watch: Option<(PathBuf, Option<(std::time::SystemTime, u64)>, bool)>,
+    watch_at: f64,
 }
 
 impl App {
@@ -153,6 +161,8 @@ impl App {
             dialog_focus: false,
             view_key: String::new(),
             view_at: -1.0,
+            watch: None,
+            watch_at: 0.0,
         }
     }
 
@@ -279,6 +289,12 @@ impl App {
                 }
             }
             Action::Read => self.close_editor(),
+            Action::Block(op, line) => {
+                if let Some(e) = &mut self.editor {
+                    let folds = self.folds.get(&e.path).cloned().unwrap_or_default();
+                    e.block_op(ctx, op, line, &folds);
+                }
+            }
             Action::Back => {
                 if !self.selected.is_empty() {
                     self.selected.clear();
@@ -539,8 +555,8 @@ impl App {
         let (esc, up, down, enter) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Escape),
-                i.consume_key(Modifiers::NONE, Key::ArrowUp),
-                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::ArrowUp) || i.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown) || i.consume_key(Modifiers::NONE, Key::ArrowRight),
                 i.consume_key(Modifiers::NONE, Key::Enter),
             )
         });
@@ -804,10 +820,18 @@ impl App {
     }
 
     pub fn open_menu(&mut self, ui: &Ui, at: MenuAt, items: Vec<MenuItem>) {
-        self.menu = Some(Menu { at, items, opened_at: ui.input(|i| i.time), hl: None });
+        self.menu = Some(Menu { at, items, opened_at: ui.input(|i| i.time), hl: None, row: false });
+    }
+
+    /// Open `items` as one row of icon buttons.
+    pub fn open_bar(&mut self, ui: &Ui, at: MenuAt, items: Vec<MenuItem>) {
+        self.menu = Some(Menu { at, items, opened_at: ui.input(|i| i.time), hl: None, row: true });
     }
 
     fn draw_menu(&mut self, ctx: &egui::Context) {
+        if self.menu.as_ref().map(|m| m.row).unwrap_or(false) {
+            return self.draw_bar(ctx);
+        }
         let Some(menu) = &mut self.menu else { return };
         let screen = ctx.content_rect();
         let h: f32 = menu.items.iter().map(|m| if m.action.is_some() { 40.0 } else { 12.0 }).sum::<f32>() + 12.0;
@@ -884,6 +908,78 @@ impl App {
         if ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && now - opened_at > 0.05 {
             close = true;
         }
+        if let Some(a) = chosen {
+            self.actions.push(a);
+            close = true;
+        }
+        if close {
+            self.menu = None;
+        }
+    }
+
+    /// The icon-row flavour of a menu: 40px buttons, thin dividers for separators.
+    fn draw_bar(&mut self, ctx: &egui::Context) {
+        let Some(menu) = &mut self.menu else { return };
+        let screen = ctx.content_rect();
+        const B: f32 = 38.0;
+        let w: f32 = menu.items.iter().map(|m| if m.action.is_some() { B } else { 9.0 }).sum::<f32>() + 10.0;
+        let h = B + 10.0;
+        let mut pos = match menu.at {
+            MenuAt::Below(r) => pos2(r.max.x - w + 4.0, r.max.y + 6.0),
+            MenuAt::Above(r) => {
+                if r.min.y - h - 6.0 >= screen.min.y + 8.0 {
+                    pos2(r.max.x - w + 4.0, r.min.y - h - 6.0)
+                } else {
+                    pos2(r.max.x - w + 4.0, r.max.y + 6.0)
+                }
+            }
+            MenuAt::Point(p) => p,
+        };
+        pos.x = pos.x.min(screen.max.x - w - 8.0).max(screen.min.x + 8.0);
+        pos.y = pos.y.min(screen.max.y - h - 8.0).max(screen.min.y + 8.0);
+        let t = widgets::progress(ctx, menu.opened_at, 0.12);
+        let e = widgets::ease_out(t);
+        pos.y += (1.0 - e) * 4.0;
+        let mut chosen = None;
+        let opened_at = menu.opened_at;
+        let mut hover = None;
+        let area = egui::Area::new(egui::Id::new("menu")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+            ui.multiply_opacity(e);
+            egui::Frame::new().fill(MENU).stroke(Stroke::new(LINE, BORDER)).corner_radius(14).inner_margin(5).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for (i, it) in menu.items.iter().enumerate() {
+                        match &it.action {
+                            None => {
+                                let (r, _) = ui.allocate_exact_size(vec2(9.0, B), Sense::hover());
+                                ui.painter().line_segment([pos2(r.center().x, r.min.y + 9.0), pos2(r.center().x, r.max.y - 9.0)], Stroke::new(1.0, DIVIDER));
+                            }
+                            Some(a) => {
+                                let (r, resp) = ui.allocate_exact_size(vec2(B, B), Sense::click());
+                                let tip = if it.key.is_empty() { it.label.clone() } else { format!("{}   {}", it.label, it.key) };
+                                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+                                if resp.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                                    hover = Some(i);
+                                }
+                                if resp.hovered() || menu.hl == Some(i) {
+                                    ui.painter().rect_filled(r, 10, MENU_HOVER);
+                                }
+                                let col = if it.icon == Icon::Trash { Color32::from_rgb(0xff, 0x6b, 0x6b) } else { WHITE };
+                                icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(18.0, 18.0)), it.icon, col);
+                                if resp.clicked() {
+                                    chosen = Some(a.clone());
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        if hover.is_some() {
+            menu.hl = hover;
+        }
+        let now = ctx.input(|i| i.time);
+        let mut close = ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && now - opened_at > 0.05;
         if let Some(a) = chosen {
             self.actions.push(a);
             close = true;
@@ -1388,8 +1484,58 @@ impl eframe::App for App {
             }
         }
 
+        self.watch_note(&ctx, now);
+
         for a in std::mem::take(&mut self.actions) {
             self.run(&ctx, a);
         }
+    }
+
+}
+
+impl App {
+    /// Follow the open note on disk, so edits synced in from another device (Google Drive and
+    /// the like) show up live, in the reader and in the editor.
+    fn watch_note(&mut self, ctx: &egui::Context, now: f64) {
+        let Screen::Note(p) = self.top().clone() else {
+            self.watch = None;
+            return;
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(700));
+        if now - self.watch_at < 0.6 {
+            return;
+        }
+        self.watch_at = now;
+        let stamp = std::fs::metadata(&p).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        match &mut self.watch {
+            Some((wp, st, pending)) if *wp == p => {
+                if *st != stamp {
+                    // Changed: wait one more look so a sync app has finished writing.
+                    *st = stamp;
+                    *pending = true;
+                    return;
+                }
+                if !*pending {
+                    return;
+                }
+                *pending = false;
+            }
+            _ => {
+                self.watch = Some((p, stamp, false));
+                return;
+            }
+        }
+        let Ok(disk) = std::fs::read_to_string(&p) else { return };
+        let disk = disk.replace("\r\n", "\n");
+        if self.editing() {
+            if let Some(e) = &mut self.editor {
+                e.sync_from_disk(ctx, &disk);
+            }
+        }
+        let stale = self.tree.find(&p).map(|it| it.text != disk).unwrap_or(false);
+        if stale && self.drag.is_none() {
+            self.reload();
+        }
+        ctx.request_repaint();
     }
 }

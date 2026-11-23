@@ -15,8 +15,8 @@ android {
         applicationId = "app.noted"
         minSdk = 30
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 5
+        versionName = "0.4.0"
     }
 
     signingConfigs {
@@ -62,4 +62,5 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    testImplementation("junit:junit:4.13.2")
 }

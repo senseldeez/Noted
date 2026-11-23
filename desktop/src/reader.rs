@@ -299,6 +299,8 @@ struct R {
     toggle_list: Option<usize>,
     toggle_task: Option<usize>,
     edit_line: Option<usize>,
+    /// Where each block starts (screen y) and its first line, for double-clicks between blocks.
+    spans: Vec<(f32, usize)>,
 }
 
 /// Content that slides open and closed: drawn in a child, clipped to `t` of its height.
@@ -339,6 +341,7 @@ fn nodes(ui: &mut Ui, list: &[Node], r: &mut R, top_level: bool) {
                 let foldable = !kids.is_empty();
                 let closed = foldable && r.folds.contains(raw);
                 let top = ui.cursor().min.y;
+                r.spans.push((top, *line));
                 let resp = paint_inline(ui, r.x0, inline(text, 0..text.len(), font, color, lh, r.w));
                 if foldable {
                     let cr = Rect::from_center_size(pos2(r.x0 - 34.0 + 14.0, top + lh / 2.0), vec2(28.0, 28.0));
@@ -374,6 +377,11 @@ fn nodes(ui: &mut Ui, list: &[Node], r: &mut R, top_level: bool) {
 }
 
 fn leaf(ui: &mut Ui, b: &Blk, r: &mut R) {
+    let y = ui.cursor().min.y;
+    match b {
+        Blk::P { line, .. } | Blk::Quote { line, .. } | Blk::Code { line, .. } => r.spans.push((y, *line)),
+        _ => {}
+    }
     let (x0, w, avail) = (r.x0, r.w, r.avail);
     match b {
         Blk::P { line, text } => {
@@ -428,6 +436,7 @@ fn list_item(ui: &mut Ui, it: &Li, g: bool, x: f32, r: &mut R) {
     let has = !it.kids.is_empty();
     let closed = has && r.lfolds.contains(&it.line);
     let top = ui.cursor().min.y;
+    r.spans.push((top, it.line));
     let mut mx = x;
     let id = ui.id().with(("li", it.line));
     let mut chev_resp = None;
@@ -559,6 +568,7 @@ pub fn show(app: &mut App, ui: &mut Ui, path: PathBuf) {
         toggle_list: None,
         toggle_task: None,
         edit_line: None,
+        spans: Vec::new(),
     };
 
     egui::ScrollArea::vertical().id_salt(("reader", &path)).auto_shrink([false, false]).show(ui, |ui| {
@@ -580,7 +590,21 @@ pub fn show(app: &mut App, ui: &mut Ui, path: PathBuf) {
             let (rr, _) = ui.allocate_exact_size(vec2(avail, 20.0), Sense::hover());
             ui.painter().text(pos2(r.x0, rr.min.y), egui::Align2::LEFT_TOP, "Empty note. Press E or the pencil to start writing.", sans(13.0), MUTED);
         } else {
+            // Double-clicking anywhere beside the text (margins, gaps between blocks) edits
+            // the nearest line above. Registered first, so the text itself still wins.
+            let hid = ui.id().with("reader-bg");
+            let h: f32 = ui.ctx().data(|d| d.get_temp(hid)).unwrap_or(0.0);
+            let start = ui.cursor().min.y;
+            let full = Rect::from_min_size(pos2(ui.max_rect().min.x, start), vec2(avail, h.max(1.0)));
+            let bg = ui.interact(full, hid, Sense::click());
             nodes(ui, &tree, &mut r, true);
+            let end = ui.cursor().min.y;
+            ui.ctx().data_mut(|d| d.insert_temp(hid, end - start));
+            if bg.double_clicked() && r.edit_line.is_none() {
+                if let Some(py) = bg.interact_pointer_pos().map(|p| p.y) {
+                    r.edit_line = r.spans.iter().rev().find(|(t, _)| *t <= py).or(r.spans.first()).map(|(_, l)| *l);
+                }
+            }
         }
         // Footer
         ui.add_space(22.0);

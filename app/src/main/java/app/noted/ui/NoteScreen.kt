@@ -4,7 +4,11 @@ import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,6 +29,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalTextToolbar
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -53,6 +61,25 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/**
+ * Poll [f] and call [onChange] with its text after it changed on disk (a sync app wrote it).
+ * Waits until size and time have held still for one more look, so a half-written file is skipped.
+ */
+private suspend fun watchFile(f: File, onChange: (String) -> Unit) {
+    fun stamp() = f.lastModified() to f.length()
+    var last = withContext(Dispatchers.IO) { stamp() }
+    var pending = false
+    while (true) {
+        delay(700)
+        val now = withContext(Dispatchers.IO) { stamp() }
+        if (now != last) { last = now; pending = true; continue }
+        if (!pending) continue
+        pending = false
+        val disk = withContext(Dispatchers.IO) { try { f.readText() } catch (e: Exception) { null } } ?: continue
+        onChange(disk)
+    }
+}
+
 private fun readSafe(f: File): String = try { f.readText() } catch (e: Exception) { "" }
 private fun writeSafe(f: File, s: String) = try { f.writeText(s); true } catch (e: Exception) { false }
 
@@ -61,7 +88,7 @@ private fun startsWithH1(src: String): Boolean =
 
 @Composable
 fun NoteScreen(vm: AppViewModel, screen: Screen.Note) {
-    if (screen.editing) EditScreen(vm, screen.file) else ReadScreen(vm, screen.file)
+    if (screen.editing) EditScreen(vm, screen.file, screen.cursor) else ReadScreen(vm, screen.file)
 }
 
 @Composable
@@ -78,6 +105,12 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
             val p = Store.isPinned(file)
             val m = file.lastModified()
             withContext(Dispatchers.Main) { text = t; pinned = p; modified = m }
+        }
+    }
+    // Follow the note on disk, so edits synced in from another device show up live.
+    LaunchedEffect(file) {
+        watchFile(file) { disk ->
+            if (disk != text) { text = disk; modified = file.lastModified() }
         }
     }
     val root = vm.root
@@ -112,11 +145,16 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
                 if (t.isBlank()) {
                     Text("Empty note. Tap the pencil to start writing.", fontSize = 13.sp, color = C.Muted)
                 } else {
-                    MarkdownReader(t, folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) }, onToggleTask = { line ->
-                        val nt = toggleTaskLine(t, line)
-                        text = nt
-                        scope.launch(Dispatchers.IO) { writeSafe(file, nt); modified = file.lastModified() }
-                    })
+                    MarkdownReader(
+                        t, folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
+                        onToggleTask = { line ->
+                            val nt = toggleTaskLine(t, line)
+                            text = nt
+                            scope.launch(Dispatchers.IO) { writeSafe(file, nt); modified = file.lastModified() }
+                        },
+                        // Double-tap a line: open the editor with the caret right there.
+                        onEditAt = { at -> vm.replaceTop(Screen.Note(file, editing = true, cursor = at)) },
+                    )
                 }
                 Spacer(Modifier.height(18.dp))
                 Box(Modifier.fillMaxWidth().height(2.dp).background(C.Divider))
@@ -149,22 +187,35 @@ private fun ReadScreen(vm: AppViewModel, file: File) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun EditScreen(vm: AppViewModel, file: File) {
+private fun EditScreen(vm: AppViewModel, file: File, cursor: Int?) {
     var value by remember(file) { mutableStateOf<TextFieldValue?>(null) }
     var saved by remember(file) { mutableStateOf("") }
     var history by remember(file) { mutableStateOf<History?>(null) }
     val focus = remember { FocusRequester() }
+    val reveal = remember { BringIntoViewRequester() }
+    var editorLayout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(file) {
         val t = withContext(Dispatchers.IO) { readSafe(file) }
-        val v = TextFieldValue(t, TextRange(t.length))
+        val at = (cursor ?: t.length).coerceIn(0, t.length)
+        val v = TextFieldValue(t, TextRange(at))
         saved = t
         history = History(v)
         value = v
         delay(50)
         try { focus.requestFocus() } catch (_: Exception) {}
+        if (cursor != null) {
+            // Scroll the caret into view, again once the keyboard has slid up and shrunk the page.
+            repeat(2) {
+                delay(if (it == 0) 30 else 350)
+                val l = editorLayout ?: return@repeat
+                val r = l.getCursorRect(at.coerceIn(0, l.layoutInput.text.length))
+                try { reveal.bringIntoView(r.inflate(48f)) } catch (_: Exception) {}
+            }
+        }
     }
 
     val v = value
@@ -183,6 +234,26 @@ private fun EditScreen(vm: AppViewModel, file: File) {
             if (t != null && t != saved) Thread { writeSafe(file, t) }.start()
         }
     }
+
+    // Follow the note on disk: edits synced in from another device are merged in live, keeping
+    // whatever was typed here since the last save, and the cursor.
+    LaunchedEffect(file) {
+        watchFile(file) { disk ->
+            if (disk == saved) return@watchFile
+            val cur = value ?: return@watchFile
+            val (merged, c1) = mergeNote(saved, cur.text, disk, cur.selection.end)
+            val (_, c0) = mergeNote(saved, cur.text, disk, cur.selection.start)
+            saved = disk
+            if (merged != cur.text) {
+                val nv = TextFieldValue(merged, TextRange(c0.coerceIn(0, merged.length), c1.coerceIn(0, merged.length)))
+                history?.record(cur, nv, force = true)
+                value = nv
+            }
+        }
+    }
+    val toolbar = remember { NotedTextToolbar() }
+    val scrollState = rememberScrollState()
+    var viewport by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
 
     fun save(then: () -> Unit) {
         val t = value?.text
@@ -224,7 +295,9 @@ private fun EditScreen(vm: AppViewModel, file: File) {
         }
         if (v == null) return@Column
         Column(
-            Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
+            Modifier.weight(1f).fillMaxWidth()
+                .onGloballyPositioned { viewport = it.boundsInWindow() }
+                .verticalScroll(scrollState)
                 .padding(start = 30.dp, end = 22.dp, top = 8.dp, bottom = 24.dp),
         ) {
             if (!startsWithH1(v.text)) {
@@ -234,11 +307,16 @@ private fun EditScreen(vm: AppViewModel, file: File) {
                     modifier = Modifier.padding(bottom = 14.dp),
                 )
             }
-            LiveEditor(
-                v, { change(it) }, focus,
-                folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
-                modifier = Modifier.fillMaxWidth(),
-            )
+            CompositionLocalProvider(LocalTextToolbar provides toolbar) {
+                LiveEditor(
+                    v, { change(it) }, focus,
+                    folded = vm.foldsFor(file), onToggleFold = { vm.toggleFold(file, it) },
+                    onLayout = { editorLayout = it },
+                    modifier = Modifier.fillMaxWidth().bringIntoViewRequester(reveal),
+                    scroll = scrollState,
+                    viewport = { viewport },
+                )
+            }
             // Tapping below the text focuses the end of the note.
             Spacer(
                 Modifier.fillMaxWidth().height(240.dp).clickable(indication = null, interactionSource = null) {
@@ -246,6 +324,13 @@ private fun EditScreen(vm: AppViewModel, file: File) {
                     try { focus.requestFocus() } catch (_: Exception) {}
                 },
             )
+        }
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !v.selection.collapsed || toolbar.shown,
+            enter = androidx.compose.animation.expandVertically() + androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.shrinkVertically() + androidx.compose.animation.fadeOut(),
+        ) {
+            SelectionBar(v, { change(it, force = true) }, { toolbar.hide() }, Modifier.padding(bottom = 8.dp))
         }
         FormatToolbar(v, { change(it, force = true) }, Modifier.padding(bottom = 8.dp))
     }

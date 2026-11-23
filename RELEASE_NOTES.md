@@ -9,9 +9,12 @@ Noted is a minimal, pure-black markdown editor. Notes are plain `.md` files in a
 | Android 11+ | `Noted-*-android.apk` |
 
 ### What's new
-- The desktop app is rebuilt in native Rust (egui). It starts instantly, is a fraction of the old download size, and needs no browser engine.
-- New builds for Linux, and one universal Mac app for Apple silicon and Intel.
-- Android builds are now signed with a new release key. If you installed an earlier APK, uninstall it once before installing this one. Your notes are files in your folder and are not touched.
+- **Move blocks around.** The line you're editing now has a ⋮ handle at the end of its pill (on desktop also on any line you hover). Drag it to move the line, a list item with its sub-items, a heading with its whole section, or a code block; everything else slides out of the way. Tap or click it for Cut, Copy, Duplicate, Move up, Move down and Delete. On desktop Alt+↑/↓ moves the block too.
+- **Live sync.** An open note follows its file on disk, so when a sync app (Google Drive and the like) brings in an edit from another device, it shows up right away, in reading and editing mode. Anything you typed meanwhile is kept.
+- **Copy and paste work** again on desktop, and on Android through a Cut / Copy / Paste / Select all bar above the toolbar whenever text is selected.
+- **Wrapped lines keep their indentation**: a long list item, quote or indented line wraps under its text instead of back at the left edge.
+- A cleaner active-line pill (near-black with a fine outline) and rounded, softer text selection.
+- Double-tap (or double-click) anywhere beside the text in reading mode to start editing there, not just on the words.
 
 ### First launch on macOS
 The app is not notarized by Apple. After moving it to Applications, right-click it and choose **Open**, or run:

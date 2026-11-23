@@ -1,7 +1,9 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 mod app;
+mod blocks;
 mod editor;
 mod grid;
+mod hang;
 mod icons;
 mod md;
 mod reader;
