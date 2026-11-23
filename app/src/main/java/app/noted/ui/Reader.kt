@@ -40,6 +40,10 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextLayoutResult
@@ -133,16 +137,41 @@ fun MarkdownReader(
     val collapsed = remember { mutableStateMapOf<Int, Boolean>() }
     val edit = rememberUpdatedState(onEditAt)
     val ctx = remember(src) { ReaderCtx(src) { edit.value(it) } }
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    var colY by remember { mutableStateOf(0f) }
+    Column(
+        modifier
+            .onGloballyPositioned { colY = it.positionInRoot().y }
+            // Double-tapping beside the text (margins, gaps between blocks) edits the nearest line
+            // above. Taps on the text itself are handled (and used up) by the text first.
+            .pointerInput(ctx) {
+                detectTapGestures(onDoubleTap = { pos ->
+                    val y = colY + pos.y
+                    val line = ctx.spans.entries.filter { it.value <= y }.maxByOrNull { it.value }?.key
+                        ?: ctx.spans.entries.minByOrNull { it.value }?.key ?: return@detectTapGestures
+                    ctx.editLineEnd(line)
+                })
+            },
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
         tree.forEachIndexed { idx, n -> RenderNode(n, idx == 0, folded, onToggleFold, collapsed, onToggleTask, ctx) }
     }
 }
 
 /** Lets each rendered block turn a double-tap into a caret position in the raw note. */
 private class ReaderCtx(val src: String, val onEditAt: (Int) -> Unit) {
+    /** Where each rendered block starts on screen (root y), by its first source line. */
+    val spans = HashMap<Int, Float>()
     fun edit(firstLine: Int, shown: String, kind: SourceKind, rendered: Int) =
         onEditAt(sourceOffset(src, firstLine, shown, rendered, kind))
+    fun editLineEnd(line: Int) {
+        val lines = src.split('\n')
+        if (line !in lines.indices) return
+        onEditAt(lines.take(line).sumOf { it.length + 1 } + lines[line].length)
+    }
 }
+
+/** Remember where a block starts, for double-taps beside it. */
+private fun Modifier.track(ctx: ReaderCtx, line: Int) = onGloballyPositioned { ctx.spans[line] = it.positionInRoot().y }
 
 /** Holds a Text's last layout so a tap position can be turned into a character offset. */
 private class LayoutRef { var value: TextLayoutResult? = null }
@@ -177,7 +206,7 @@ private fun RenderNode(
             val foldable = n.children.isNotEmpty()
             val closed = foldable && b.raw in folded
             Column {
-                Box(Modifier.padding(top = if (b.level > 1 && !first) 8.dp else 0.dp)) {
+                Box(Modifier.padding(top = if (b.level > 1 && !first) 8.dp else 0.dp).track(ctx, b.line)) {
                     if (foldable) FoldChevron(closed, Modifier.offset(x = (-30).dp, y = headingChevronY(b.level))) { onToggleFold(b.raw) }
                     val ref = remember { LayoutRef() }
                     Text(
@@ -188,7 +217,7 @@ private fun RenderNode(
                         letterSpacing = if (b.level == 1) (-0.4).sp else 0.sp,
                         color = if (b.level >= 4) C.Text2 else C.White,
                         onTextLayout = { ref.value = it },
-                        modifier = Modifier
+                        modifier = Modifier.fillMaxWidth()
                             .semantics { if (foldable) onClick(if (closed) "Expand section" else "Collapse section") { onToggleFold(b.raw); true } }
                             .editOnDoubleTap(ref, if (foldable) ({ onToggleFold(b.raw) }) else null) {
                                 ctx.edit(b.line, b.text, SourceKind.PREFIXED, it)
@@ -220,19 +249,19 @@ private fun RenderBlock(b: Block, collapsed: SnapshotStateMap<Int, Boolean>, onT
         is Block.Paragraph -> Text(
             renderInline(b.text, true), fontSize = BodySize, lineHeight = 25.sp, color = C.Text2,
             onTextLayout = { ref.value = it },
-            modifier = Modifier.editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.PARAGRAPH, it) },
+            modifier = Modifier.fillMaxWidth().track(ctx, b.line).editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.PARAGRAPH, it) },
         )
-        is Block.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
+        is Block.Quote -> Row(Modifier.height(IntrinsicSize.Min).track(ctx, b.line)) {
             Box(Modifier.width(3.dp).fillMaxHeight().clip(RoundedCornerShape(2.dp)).background(C.White))
             Text(
                 renderInline(b.text, true), fontSize = BodySize, lineHeight = 25.sp, color = C.Text3,
                 fontStyle = FontStyle.Italic, onTextLayout = { ref.value = it },
-                modifier = Modifier.padding(start = 14.dp, top = 2.dp, bottom = 2.dp)
+                modifier = Modifier.weight(1f).padding(start = 14.dp, top = 2.dp, bottom = 2.dp)
                     .editOnDoubleTap(ref) { ctx.edit(b.line, b.text, SourceKind.PREFIXED, it) },
             )
         }
         is Block.Code -> Box(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(C.CodeBg)
+            Modifier.fillMaxWidth().track(ctx, b.line).clip(RoundedCornerShape(14.dp)).background(C.CodeBg)
                 .border(LineW, C.Guide, RoundedCornerShape(14.dp)).horizontalScroll(rememberScrollState()).padding(14.dp),
         ) {
             Text(
@@ -255,7 +284,7 @@ private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<I
     val hasKids = n.children.isNotEmpty()
     val isClosed = collapsed[n.line] == true
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(verticalAlignment = Alignment.Top, modifier = if (gutter) Modifier.offset(x = (-10).dp) else Modifier) {
+        Row(verticalAlignment = Alignment.Top, modifier = (if (gutter) Modifier.offset(x = (-10).dp) else Modifier).track(ctx, n.line)) {
             // Chevron gutter (only items with children can fold).
             if (gutter) Box(
                 Modifier.size(28.dp).clip(RoundedCornerShape(14.dp))
@@ -282,7 +311,8 @@ private fun ListItem(n: ListNode, gutter: Boolean, collapsed: SnapshotStateMap<I
                     else -> Box(Modifier.padding(end = 10.dp).size(5.dp).clip(RoundedCornerShape(3.dp)).background(C.White))
                 }
             }
-            Column(Modifier.padding(top = 3.dp)) {
+            // The whole row to the right of the marker takes double-taps, not just the words.
+            Column(Modifier.weight(1f).padding(top = 3.dp).editOnDoubleTap(ref) { ctx.edit(n.line, n.text, SourceKind.PREFIXED, it) }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         renderInline(n.text, true), fontSize = BodySize, lineHeight = 23.sp,
