@@ -3,6 +3,7 @@ package app.noted.ui
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import androidx.compose.ui.text.input.TextFieldValue
 
 class BlocksTest {
     private fun ls(s: String) = s.split('\n')
@@ -38,5 +39,13 @@ class BlocksTest {
         assertEquals("aaa!\nbbb\nccc?", mergeNote("aaa\nbbb\nccc", "aaa!\nbbb\nccc", "aaa\nbbb\nccc?", 4).first)
         assertEquals("aaa!\nbbb\nccc?" to 13, mergeNote("aaa\nbbb\nccc", "aaa\nbbb\nccc?", "aaa!\nbbb\nccc", 12))
         assertEquals("aXc", mergeNote("abc", "aXc", "aYc", 2).first)
+    }
+
+    @Test fun pasting() {
+        val v = TextFieldValue("a\n- one\n  - kid\nb")
+        val r = applyBlockOp(v, 1, BlockOp.PASTE, emptySet(), "x\ny\n") {}!!
+        assertEquals("a\n- one\n  - kid\nx\ny\nb", r.text)
+        assertEquals(19, r.selection.start)
+        assertNull(applyBlockOp(v, 1, BlockOp.PASTE, emptySet(), "") {})
     }
 }

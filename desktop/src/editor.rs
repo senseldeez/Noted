@@ -90,6 +90,7 @@ struct BlockDrag {
 pub enum BlockOp {
     Cut,
     Copy,
+    Paste,
     Duplicate,
     Up,
     Down,
@@ -217,6 +218,22 @@ impl Editor {
                 let t = rest.join("\n");
                 // The cursor goes to the start of whatever now fills the gap.
                 let at = rest[..blk.start.min(rest.len())].iter().map(|l| l.chars().count() + 1).sum::<usize>().min(t.chars().count());
+                self.replace_text(ctx, t, (at, at));
+            }
+            BlockOp::Paste => {
+                // The clipboard goes in as lines of their own, right after the block.
+                let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                let add = clip.replace("\r\n", "\n");
+                let add = add.trim_end_matches('\n');
+                if add.is_empty() {
+                    return;
+                }
+                let mut out: Vec<&str> = lines[..blk.end].to_vec();
+                out.extend(add.split('\n'));
+                out.extend_from_slice(&lines[blk.end..]);
+                let t = out.join("\n");
+                let at = starts.get(blk.end).copied().unwrap_or(text.chars().count() + 1) + add.chars().count();
+                let at = at.min(t.chars().count());
                 self.replace_text(ctx, t, (at, at));
             }
             BlockOp::Duplicate => {
@@ -940,7 +957,8 @@ fn pill_shapes(r: Rect, a: f32) -> [Shape; 2] {
 
 /// The block handle's spot: inside the pill's right end, centred on the line's first row.
 fn handle_rect(pill_right: f32, line_top: f32) -> Rect {
-    Rect::from_center_size(pos2(pill_right - 4.0 - 13.0, line_top + LH / 2.0), vec2(26.0, 26.0))
+    // The pill is one line (LH) tall; keep 4px of it showing around the handle on every side.
+    Rect::from_center_size(pos2(pill_right - 4.0 - 11.0, line_top + LH / 2.0), vec2(22.0, LH - 8.0))
 }
 
 fn paint_handle(p: &egui::Painter, r: Rect, a: f32, hover: f32) {
@@ -948,9 +966,9 @@ fn paint_handle(p: &egui::Painter, r: Rect, a: f32, hover: f32) {
         return;
     }
     let bg = widgets::lerp_color(Color32::from_gray(0x1f), Color32::from_gray(0x2e), hover);
-    p.rect_filled(r, 9, bg.gamma_multiply(a));
+    p.rect_filled(r, 7, bg.gamma_multiply(a));
     let fg = widgets::lerp_color(Color32::from_gray(0xb5), WHITE, hover);
-    icons::paint(p, Rect::from_center_size(r.center(), vec2(15.0, 15.0)), Icon::Grip, fg.gamma_multiply(a));
+    icons::paint(p, Rect::from_center_size(r.center(), vec2(14.0, 14.0)), Icon::Grip, fg.gamma_multiply(a));
 }
 
 /// Key hint chip drawn from its left edge; returns its width.
@@ -2070,6 +2088,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let items = vec![
             mi(Icon::Cut, "Cut", "", b(BlockOp::Cut)),
             mi(Icon::Copy, "Copy", "", b(BlockOp::Copy)),
+            mi(Icon::Paste, "Paste below", "", b(BlockOp::Paste)),
             mi(Icon::Duplicate, "Duplicate", "", b(BlockOp::Duplicate)),
             sep(),
             mi(Icon::ArrowUp, "Move up", "Alt ↑", b(BlockOp::Up)),
@@ -2077,7 +2096,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             sep(),
             mi(Icon::Trash, "Delete", "", b(BlockOp::Delete)),
         ];
-        app.open_menu(ui, MenuAt::Below(hr), items);
+        app.open_bar(ui, MenuAt::Above(hr), items);
     }
 
     if let Some(k) = fold_toggle {

@@ -88,6 +88,14 @@ import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.width
 import androidx.compose.ui.unit.sp
 
 /* ------------------------------------------------------------------ */
@@ -281,10 +289,10 @@ private fun decorations(raw: String, active: IntRange, folded: Set<String>): Lis
 }
 
 /** What the block menu (the ⋮ handle) can do. */
-enum class BlockOp { CUT, COPY, DUPLICATE, UP, DOWN, DELETE }
+enum class BlockOp { CUT, COPY, PASTE, DUPLICATE, UP, DOWN, DELETE }
 
 /** Apply a block-menu action to the block holding line [line]. Returns the new value, or null. */
-fun applyBlockOp(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>, copy: (String) -> Unit): TextFieldValue? {
+fun applyBlockOp(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>, clip: String = "", copy: (String) -> Unit): TextFieldValue? {
     val lines = v.text.split('\n')
     if (line !in lines.indices) return null
     val infos = classifyLines(lines)
@@ -299,6 +307,14 @@ fun applyBlockOp(v: TextFieldValue, line: Int, op: BlockOp, folded: Set<String>,
             val t = rest.joinToString("\n")
             val at = rest.take(blk.first).sumOf { it.length + 1 }.coerceAtMost(t.length)
             TextFieldValue(t, TextRange(at))
+        }
+        BlockOp.PASTE -> {
+            // The clipboard goes in as lines of their own, right after the block.
+            val add = clip.replace("\r\n", "\n").trimEnd('\n')
+            if (add.isEmpty()) return null
+            val out = lines.subList(0, blk.last) + add.split('\n') + lines.subList(blk.last, lines.size)
+            val t = out.joinToString("\n")
+            TextFieldValue(t, TextRange((startOf(blk.last) + add.length).coerceAtMost(t.length)))
         }
         BlockOp.DUPLICATE -> {
             val out = lines.subList(0, blk.last) + lines.subList(blk.first, blk.last) + lines.subList(blk.last, lines.size)
@@ -346,6 +362,9 @@ private class BlockDrag(val block: LineSpan, val units: List<LineSpan>, val home
 val PillFill = Color(0xFF111111)
 val PillLine = Color(0xFF2A2A2A)
 private val HandleBg = Color(0xFF1F1F1F)
+/** The handle sits inside the pill's right end: this wide, this far from its edge. */
+private val HandleW = 22.dp
+private val HandleInset = 4.dp
 /** Selected text sits on a soft white highlight with rounded corners. */
 val SelectionFill = Color.White.copy(alpha = 0.24f)
 /** Room kept at the right of the text for the block handle. */
@@ -606,8 +625,8 @@ fun LiveEditor(
                             clipRect(left = -2000f, top = dd.top, right = size.width + 2000f, bottom = dd.top + dd.height) { drawText(l) }
                         }
                         // Its handle rides along.
-                        val hc = Offset(size.width + HandleRoom.toPx() - 6.dp.toPx(), bt + half)
-                        drawHandle(hc, 1f)
+                        val hc = Offset(size.width + HandleRoom.toPx() - HandleInset.toPx() - HandleW.toPx() / 2f, bt + half)
+                        drawHandle(hc, 2f * half - 6.dp.toPx(), 1f)
                     },
             )
         }
@@ -635,9 +654,11 @@ fun LiveEditor(
             var menu by remember { mutableStateOf(false) }
             var coords by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
             val cur = remember(value.selection, lines) { lineIndexOf(value.selection.start.coerceIn(0, value.text.length)) }
+            // The pill ends 12dp past our right edge; centre the handle [HandleInset] inside it.
+            val hx = with(density) { (12.dp - HandleInset - HandleW / 2 + 18.dp).roundToPx() }
             Box(
                 Modifier.align(Alignment.TopEnd)
-                    .offset { IntOffset(with(density) { 8.dp.roundToPx() }, (pillTop + half - with(density) { 18.dp.toPx() }).roundToInt()) }
+                    .offset { IntOffset(hx, (pillTop + half - with(density) { 18.dp.toPx() }).roundToInt()) }
                     .size(36.dp)
                     .onGloballyPositioned { coords = it }
                     .graphicsLayer { alpha = if (drag == null) 1f else 0f }
@@ -661,20 +682,18 @@ fun LiveEditor(
                     .semantics { contentDescription = "Block actions" },
                 contentAlignment = Alignment.Center,
             ) {
-                Box(Modifier.size(26.dp).clip(RoundedCornerShape(9.dp)).background(HandleBg), contentAlignment = Alignment.Center) {
-                    Icon(Icons.More, null, tint = C.Text3, modifier = Modifier.size(15.dp))
+                val hh = with(density) { (2f * half).toDp() - 6.dp }
+                Box(Modifier.width(HandleW).height(hh).clip(RoundedCornerShape(7.dp)).background(HandleBg), contentAlignment = Alignment.Center) {
+                    Icon(Icons.More, null, tint = C.Text3, modifier = Modifier.size(14.dp))
                 }
-                Menu(
-                    menu, { menu = false },
-                    listOf(
-                        "Cut" to { applyBlockOp(latest, cur, BlockOp.CUT, latestFolded) { clipboard.setText(AnnotatedString(it)) }?.let(onValueChange); Unit },
-                        "Copy" to { applyBlockOp(latest, cur, BlockOp.COPY, latestFolded) { clipboard.setText(AnnotatedString(it)) }; Unit },
-                        "Duplicate" to { applyBlockOp(latest, cur, BlockOp.DUPLICATE, latestFolded) {}?.let(onValueChange); Unit },
-                        "Move up" to { applyBlockOp(latest, cur, BlockOp.UP, latestFolded) {}?.let(onValueChange); Unit },
-                        "Move down" to { applyBlockOp(latest, cur, BlockOp.DOWN, latestFolded) {}?.let(onValueChange); Unit },
-                        "Delete" to { applyBlockOp(latest, cur, BlockOp.DELETE, latestFolded) {}?.let(onValueChange); Unit },
-                    ),
-                )
+                if (menu) {
+                    fun run(op: BlockOp) {
+                        menu = false
+                        val clip = if (op == BlockOp.PASTE) clipboard.getText()?.text.orEmpty() else ""
+                        applyBlockOp(latest, cur, op, latestFolded, clip) { clipboard.setText(AnnotatedString(it)) }?.let(onValueChange)
+                    }
+                    BlockMenu(onDismiss = { menu = false }, onPick = ::run)
+                }
             }
         }
     }
@@ -683,10 +702,11 @@ fun LiveEditor(
 /** Handles and the caret stay white; the highlight itself is drawn by the editor, rounded. */
 val NotedSelectionColors = TextSelectionColors(handleColor = C.White, backgroundColor = Color.Transparent)
 
-private fun DrawScope.drawHandle(c: Offset, a: Float) {
-    val s = 26.dp.toPx()
-    drawRoundRect(HandleBg.copy(alpha = a), Offset(c.x - s / 2, c.y - s / 2), Size(s, s), CornerRadius(9.dp.toPx()))
-    for (k in -1..1) drawCircle(C.Text3.copy(alpha = a), 1.6.dp.toPx(), Offset(c.x, c.y + k * 5.dp.toPx()))
+/** The ⋮ handle: [h] px tall, [HandleW] wide, centred on [c]. */
+private fun DrawScope.drawHandle(c: Offset, h: Float, a: Float) {
+    val w = HandleW.toPx()
+    drawRoundRect(HandleBg.copy(alpha = a), Offset(c.x - w / 2, c.y - h / 2), Size(w, h), CornerRadius(7.dp.toPx()))
+    for (k in -1..1) drawCircle(C.Text3.copy(alpha = a), 1.4.dp.toPx(), Offset(c.x, c.y + k * 4.2.dp.toPx()))
 }
 
 private fun DrawScope.drawCodeBox(top: Float, bottom: Float, width: Float) {
@@ -1110,5 +1130,45 @@ private fun androidx.compose.foundation.layout.RowScope.ToolIcon(icon: ImageVect
         contentAlignment = Alignment.Center,
     ) {
         Icon(icon, desc, tint = if (on) C.Black else C.White, modifier = Modifier.size(20.dp))
+    }
+}
+
+/** Puts the block menu just above its anchor, right-aligned to it, or below when there is no room above. */
+private class AboveAnchor(val gap: Int) : PopupPositionProvider {
+    override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection, popupContentSize: IntSize): IntOffset {
+        val x = (anchorBounds.right - popupContentSize.width).coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
+        val above = anchorBounds.top - gap - popupContentSize.height
+        val y = if (above >= 0) above else anchorBounds.bottom + gap
+        return IntOffset(x, y)
+    }
+}
+
+/** The block menu: one compact row of icons, grouped as clipboard, moving, and deleting. */
+@Composable
+private fun BlockMenu(onDismiss: () -> Unit, onPick: (BlockOp) -> Unit) {
+    val gap = with(LocalDensity.current) { 6.dp.roundToPx() }
+    Popup(popupPositionProvider = remember(gap) { AboveAnchor(gap) }, onDismissRequest = onDismiss, properties = PopupProperties(focusable = false, dismissOnClickOutside = true)) {
+        val shape = RoundedCornerShape(16.dp)
+        Row(
+            Modifier.clip(shape).background(Color(0xFF141414)).border(LineW, C.Border, shape).padding(horizontal = 4.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            @Composable fun item(op: BlockOp, icon: ImageVector, label: String, tint: Color = C.White) {
+                Box(
+                    Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)).clickable { onPick(op) }.semantics { contentDescription = label },
+                    contentAlignment = Alignment.Center,
+                ) { Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp)) }
+            }
+            @Composable fun divider() = Box(Modifier.padding(horizontal = 3.dp).width(1.dp).height(22.dp).background(C.Border))
+            item(BlockOp.CUT, Icons.Cut, "Cut")
+            item(BlockOp.COPY, Icons.Copy, "Copy")
+            item(BlockOp.PASTE, Icons.Paste, "Paste below")
+            item(BlockOp.DUPLICATE, Icons.Duplicate, "Duplicate")
+            divider()
+            item(BlockOp.UP, Icons.ArrowUp, "Move up")
+            item(BlockOp.DOWN, Icons.ArrowDown, "Move down")
+            divider()
+            item(BlockOp.DELETE, Icons.Delete, "Delete", Color(0xFFFF6B6B))
+        }
     }
 }

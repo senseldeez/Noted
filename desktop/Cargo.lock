@@ -1806,6 +1806,7 @@ dependencies = [
 name = "noted"
 version = "0.4.0"
 dependencies = [
+ "arboard",
  "directories",
  "eframe",
  "egui",

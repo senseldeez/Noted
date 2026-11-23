@@ -46,6 +46,7 @@ pub enum Icon {
     ArrowUp,
     ArrowDown,
     Grip,
+    Paste,
 }
 
 /// Draw `icon` centred in `rect`, designed on a 24-unit grid.
@@ -269,6 +270,10 @@ pub fn paint_rot(p: &Painter, rect: Rect, icon: Icon, color: Color32, angle: f32
         Icon::ArrowDown => {
             line(&[(12.0, 5.0), (12.0, 19.0)]);
             line(&[(6.0, 13.0), (12.0, 19.0), (18.0, 13.0)]);
+        }
+        Icon::Paste => {
+            rrect(9.0, 3.5, 15.0, 6.5, 1.0);
+            line(&[(9.0, 5.0), (6.0, 5.0), (5.0, 6.0), (5.0, 20.0), (6.0, 21.0), (18.0, 21.0), (19.0, 20.0), (19.0, 6.0), (18.0, 5.0), (15.0, 5.0)]);
         }
         Icon::Grip => {
             dot(12.0, 5.5, 2.0);
