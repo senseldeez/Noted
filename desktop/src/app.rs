@@ -48,6 +48,8 @@ pub enum Action {
     ClearSelection,
     Undo,
     Redo,
+    /// A block-menu action on the block starting at this line of the open note.
+    Block(crate::editor::BlockOp, usize),
 }
 
 pub struct MenuItem {
@@ -126,6 +128,10 @@ pub struct App {
     dialog_focus: bool,
     view_key: String,
     view_at: f64,
+    /// The open note's last seen size and time on disk, whether it changed since the last
+    /// look, and when we last looked.
+    watch: Option<(PathBuf, Option<(std::time::SystemTime, u64)>, bool)>,
+    watch_at: f64,
 }
 
 impl App {
@@ -153,6 +159,8 @@ impl App {
             dialog_focus: false,
             view_key: String::new(),
             view_at: -1.0,
+            watch: None,
+            watch_at: 0.0,
         }
     }
 
@@ -279,6 +287,12 @@ impl App {
                 }
             }
             Action::Read => self.close_editor(),
+            Action::Block(op, line) => {
+                if let Some(e) = &mut self.editor {
+                    let folds = self.folds.get(&e.path).cloned().unwrap_or_default();
+                    e.block_op(ctx, op, line, &folds);
+                }
+            }
             Action::Back => {
                 if !self.selected.is_empty() {
                     self.selected.clear();
@@ -1388,8 +1402,58 @@ impl eframe::App for App {
             }
         }
 
+        self.watch_note(&ctx, now);
+
         for a in std::mem::take(&mut self.actions) {
             self.run(&ctx, a);
         }
+    }
+
+}
+
+impl App {
+    /// Follow the open note on disk, so edits synced in from another device (Google Drive and
+    /// the like) show up live, in the reader and in the editor.
+    fn watch_note(&mut self, ctx: &egui::Context, now: f64) {
+        let Screen::Note(p) = self.top().clone() else {
+            self.watch = None;
+            return;
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(700));
+        if now - self.watch_at < 0.6 {
+            return;
+        }
+        self.watch_at = now;
+        let stamp = std::fs::metadata(&p).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        match &mut self.watch {
+            Some((wp, st, pending)) if *wp == p => {
+                if *st != stamp {
+                    // Changed: wait one more look so a sync app has finished writing.
+                    *st = stamp;
+                    *pending = true;
+                    return;
+                }
+                if !*pending {
+                    return;
+                }
+                *pending = false;
+            }
+            _ => {
+                self.watch = Some((p, stamp, false));
+                return;
+            }
+        }
+        let Ok(disk) = std::fs::read_to_string(&p) else { return };
+        let disk = disk.replace("\r\n", "\n");
+        if self.editing() {
+            if let Some(e) = &mut self.editor {
+                e.sync_from_disk(ctx, &disk);
+            }
+        }
+        let stale = self.tree.find(&p).map(|it| it.text != disk).unwrap_or(false);
+        if stale && self.drag.is_none() {
+            self.reload();
+        }
+        ctx.request_repaint();
     }
 }
